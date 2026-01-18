@@ -1,0 +1,441 @@
+{
+  "branchName": "ralph/rlm-rs-v1",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Bootstrap uv monorepo skeleton",
+      "acceptanceCriteria": [
+        "Project uses uv with pyproject.toml and a Python 3.11+ src/ layout package named rlm_rs.",
+        "uv --version runs successfully.",
+        "uv sync completes without errors.",
+        "uv run python -c \"import rlm_rs; print('ok')\" prints ok.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-002",
+      "title": "Define core Pydantic schemas",
+      "acceptanceCriteria": [
+        "src/rlm_rs/models.py defines Pydantic v2 models for budgets/limits, tool request envelopes (llm and search), step I/O (StepEvent, StepResult), span logs/refs, and the HTTP request/response bodies for the /v1 endpoints in the plan.",
+        "uv run python -c \"from rlm_rs.models import StepEvent, StepResult; print(StepEvent.model_json_schema()['title'], StepResult.model_json_schema()['title'])\" prints StepEvent StepResult.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q tests/unit -k models exits 0."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-003",
+      "title": "Implement spec error envelope helpers",
+      "acceptanceCriteria": [
+        "src/rlm_rs/errors.py defines the standard spec error envelope and error codes plus raise_http_error(code, message, details).",
+        "Error envelope is JSON serializable and preserves code, message, and details in unit tests.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-004",
+      "title": "Add settings and structured logging",
+      "acceptanceCriteria": [
+        "src/rlm_rs/settings.py provides env-driven config for AWS region, DDB prefix, S3 bucket, LocalStack endpoint override, parser URL, orchestrator-only provider settings, budgets/models blobs, and feature flags enable_search, enable_mcp, enable_trace_redaction.",
+        "src/rlm_rs/logging.py configures JSON logs via structlog with request_id, tenant_id, session_id, execution_id and optional OpenTelemetry that safely no-ops when unset.",
+        "uv run python -c \"from rlm_rs.settings import Settings; s=Settings(); print('loaded', bool(s.aws_region))\" prints loaded and a boolean.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 4,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-005",
+      "title": "Add Docker Compose LocalStack baseline",
+      "acceptanceCriteria": [
+        "compose.yaml includes a localstack service configured for s3,dynamodb and documents endpoint override env vars for services.",
+        "scripts/localstack_init.sh creates the S3 bucket and DynamoDB tables rlm_sessions, rlm_documents, rlm_executions, rlm_execution_state, rlm_api_keys, rlm_audit_log.",
+        "docker compose up -d localstack succeeds.",
+        "docker compose exec -T localstack awslocal s3 ls succeeds.",
+        "docker compose exec -T localstack awslocal dynamodb list-tables shows all required tables.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 5,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-006",
+      "title": "Implement S3 storage helpers",
+      "acceptanceCriteria": [
+        "src/rlm_rs/storage/s3.py provides boto3 helpers for put/get, range reads, gzip put/get, and deterministic JSON serialization for checksum stability.",
+        "Deterministic serialization is verified by repeating the same logical JSON and observing identical bytes and checksum in tests.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q tests/unit -k s3 exits 0."
+      ],
+      "priority": 6,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-007",
+      "title": "Implement DynamoDB storage helpers",
+      "acceptanceCriteria": [
+        "src/rlm_rs/storage/ddb.py provides boto3 CRUD wrappers for sessions, documents, executions, and execution_state with explicit key design and conditional status transitions.",
+        "A lease/lock helper prevents two orchestrators from advancing the same execution concurrently using conditional writes.",
+        "Integration test with LocalStack passes: uv run pytest -q tests/integration -k ddb_s3_roundtrip exits 0.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 7,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-008",
+      "title": "Implement JSON-only state offload policy",
+      "acceptanceCriteria": [
+        "src/rlm_rs/storage/state.py enforces JSON-only state, rejecting non-JSON types and applying inline versus S3 offload with stored checksum and summary metadata.",
+        "Cutoffs are configurable and tests cover both inline and offload paths without hardcoded unexplained constants.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q tests/unit -k state_json_validation exits 0."
+      ],
+      "priority": 8,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-009",
+      "title": "Implement parser service and client",
+      "acceptanceCriteria": [
+        "src/rlm_rs/parser/service.py implements FastAPI POST /parse that reads a raw S3 object and writes deterministic canonical text.txt, meta.json, and offsets.json to parsed/... in S3.",
+        "Parse responses return a non-empty text_checksum and repeated parses of the same input are byte-identical.",
+        "src/rlm_rs/parser/client.py uses httpx with tenacity retries and timeouts suitable for ingestion worker calls.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 9,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-010",
+      "title": "Implement sandbox AST policy",
+      "acceptanceCriteria": [
+        "src/rlm_rs/sandbox/ast_policy.py enforces Appendix B: rejects imports, globals/nonlocal, dunder attribute access, and banned names/modules.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q tests/unit -k ast_policy exits 0."
+      ],
+      "priority": 10,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-011",
+      "title": "Implement ContextView/DocView span slicing",
+      "acceptanceCriteria": [
+        "src/rlm_rs/sandbox/context.py implements ContextView and DocView backed by canonical parsed text in S3 with lazy reads instead of loading entire docs into LLM context.",
+        "DocView slicing and slice(a,b,tag) append span log entries with doc_index, start_char, end_char, and tag.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q tests/unit -k span_logging exits 0."
+      ],
+      "priority": 11,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-012",
+      "title": "Implement sandbox ToolAPI request queueing",
+      "acceptanceCriteria": [
+        "src/rlm_rs/sandbox/tool_api.py implements queue_llm, queue_search, YIELD, and FINAL, producing normalized tool request envelopes.",
+        "Per-step max tool request limits are enforced via limits snapshots and covered by tests.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 12,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-013",
+      "title": "Implement sandbox step executor and adapters",
+      "acceptanceCriteria": [
+        "src/rlm_rs/sandbox/step_executor.py enforces AST policy, restricts builtins (no open, __import__, eval, exec), injects context/state/tool, captures stdout with truncation, and enforces limits on spans, tool requests, and state size.",
+        "src/rlm_rs/sandbox/lambda_handler.py converts Lambda events to StepEvent/StepResult using the shared executor and includes a local adapter for dev.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q tests/unit -k step_executor_limits exits 0."
+      ],
+      "priority": 13,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-014",
+      "title": "Implement citation checksum utilities",
+      "acceptanceCriteria": [
+        "src/rlm_rs/orchestrator/citations.py merges and deduplicates spans and computes checksums using NFC normalization and SHA-256 over UTF-8 bytes.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q tests/unit -k checksum_determinism exits 0."
+      ],
+      "priority": 14,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-015",
+      "title": "Add FastAPI service skeleton and health",
+      "acceptanceCriteria": [
+        "FastAPI app under src/rlm_rs/api/ wires routers and dependencies for settings, logging, and storage.",
+        "GET /health/live returns JSON with status equal to ok.",
+        "GET /health/ready returns JSON with status equal to ok when dependencies are reachable.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 15,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-016",
+      "title": "Add API auth with hashed API keys",
+      "acceptanceCriteria": [
+        "Protected endpoints require Authorization: Bearer rlm_key_... and missing or invalid keys return 401 using the spec error envelope.",
+        "API keys are stored as a keyed HMAC-SHA256 hash with a server-side pepper and compared via hmac.compare_digest.",
+        "Tenant ownership checks are enforced for all storage access paths.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 16,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-017",
+      "title": "Implement sessions endpoints",
+      "acceptanceCriteria": [
+        "POST /v1/sessions, GET /v1/sessions/{session_id}, and DELETE /v1/sessions/{session_id} are implemented exactly as listed in the plan.",
+        "Creating a session persists the session record and associated document records with initial ingest status as described in the ingestion plan.",
+        "Cross-tenant access is blocked with the spec error envelope.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 17,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-018",
+      "title": "Implement Answerer executions endpoints",
+      "acceptanceCriteria": [
+        "POST /v1/sessions/{session_id}/executions, GET /v1/executions/{execution_id}, and POST /v1/executions/{execution_id}/wait are implemented exactly as listed in the plan.",
+        "Creating an execution persists execution and execution_state records that comply with the JSON-only state policy.",
+        "wait behavior matches the spec using deterministic fakes in integration tests.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 18,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-019",
+      "title": "Implement runtime mode step and tool resolution",
+      "acceptanceCriteria": [
+        "POST /v1/sessions/{session_id}/executions/runtime, POST /v1/executions/{execution_id}/steps, and POST /v1/executions/{execution_id}/tools/resolve are implemented exactly as listed in the plan.",
+        "/steps runs the sandbox executor and persists stdout, state, span_log, and tool_requests; /tools/resolve resolves queued tool requests out-of-sandbox and writes results into state['_tool_results'].",
+        "Runtime mode integration with a fake provider queues one LLM request, resolves it, and finalizes with tool.FINAL.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 19,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-020",
+      "title": "Implement spans and citation verification endpoints",
+      "acceptanceCriteria": [
+        "POST /v1/spans/get and POST /v1/citations/verify are implemented using runtime span logs rather than parsing generated code.",
+        "Integration coverage verifies a valid SpanRef passes and a tampered SpanRef fails.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 20,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-021",
+      "title": "Implement ingestion worker parse pipeline",
+      "acceptanceCriteria": [
+        "Ingestion worker polls DynamoDB for documents with ingest_status REGISTERED or PARSING and sessions in CREATING, calls the parser service, updates document pointers and checksums, and sets ingest_status to PARSED.",
+        "Session readiness follows the plan: readiness_mode=LAX becomes READY after PARSED; readiness_mode=STRICT remains blocked until indexing is implemented.",
+        "Idempotency is verified: retries do not corrupt state or pointers.",
+        "Local smoke is documented and works: upload a small raw doc to S3, POST /v1/sessions referencing it, then GET /v1/sessions/{id} returns READY with text_s3_uri present.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 21,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-022",
+      "title": "Implement orchestrator root prompt and parser",
+      "acceptanceCriteria": [
+        "Root prompt builder matches Appendix D intent and supports toggling subcalls enabled or disabled.",
+        "Root output parser enforces exactly one ```repl ...``` block and rejects any output outside the block.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q tests/unit -k root_output_parser exits 0."
+      ],
+      "priority": 22,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-023",
+      "title": "Implement Answerer orchestrator loop with FakeLLMProvider",
+      "acceptanceCriteria": [
+        "Orchestrator worker implements the managed RLM loop: invokes sandbox steps, resolves LLM tool requests with a deterministic FakeLLMProvider, and persists status transitions in DynamoDB using the execution lease to avoid double-advance.",
+        "Budgets are enforced at the orchestrator level (turns, time, total subcalls, total prompt characters) in addition to sandbox per-step limits.",
+        "Integration with FakeLLMProvider completes an Answerer execution that terminates via tool.FINAL and persists COMPLETED status with citations present.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 23,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-024",
+      "title": "Add OpenAI provider integration and S3 cache",
+      "acceptanceCriteria": [
+        "LLM provider interface includes an OpenAIProvider using the official openai Python SDK and a FakeLLMProvider for tests.",
+        "Provider calls use tenacity to apply consistent retry and timeout policies.",
+        "S3-backed caching uses stable hash keys per spec 12.3; repeated identical requests hit the cache in tests.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 24,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-025",
+      "title": "Add end-to-end local smoke test script",
+      "acceptanceCriteria": [
+        "scripts/smoke_test.sh starts compose dependencies, uploads a tiny fixture doc to raw S3, creates a session, waits for READY, starts an Answerer execution (FakeLLMProvider by default), polls to completion, and verifies citations via /v1/citations/verify.",
+        "bash scripts/smoke_test.sh exits 0 and prints the final answer plus at least one valid=true citation verification result.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 25,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-026",
+      "title": "Harden safety and determinism tests",
+      "acceptanceCriteria": [
+        "Test suite covers AST rejection (imports, dunder access, banned builtins and names), sandbox limits for infinite loops, stdout truncation, max spans per step, state JSON validation and offload behavior, and citation checksum mismatch detection.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 26,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-027",
+      "title": "Add Docker images and .env.example",
+      "acceptanceCriteria": [
+        "Dockerfiles docker/api.Dockerfile, docker/worker.Dockerfile, and docker/parser.Dockerfile build using uv sync --frozen.",
+        ".env.example documents all env vars and defaults for API, workers, and parser, including LocalStack overrides and feature flags.",
+        "docker compose build succeeds, then docker compose up -d starts services.",
+        "curl -sS http://localhost:<api_port>/health/ready | jq -r .status returns ok (using the mapped API port from compose.yaml).",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 27,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-028",
+      "title": "Add rate limiting, request limits, observability",
+      "acceptanceCriteria": [
+        "Per-tenant rate limiting and request size limits are enforced with configurable thresholds and tests using low thresholds to verify 429 and 413 behaviors.",
+        "Trace redaction controls return_trace and redact_trace can be toggled by configuration.",
+        "Metrics via prometheus-client and optional OpenTelemetry tracing are wired and safe to disable by environment variables.",
+        "Secrets boundary is preserved: sandbox step execution receives no provider secrets and cannot make provider calls, with regression tests covering this boundary.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 28,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-029",
+      "title": "Add load-test harness (small scale first)",
+      "acceptanceCriteria": [
+        "scripts/load_test.sh runs the smoke test repeatedly and records budgets distribution, cache hit rates, and execution durations to a local artifact (JSON or CSV).",
+        "Sub-minute version runs first to validate the pipeline, and scaling changes only one scale parameter at a time.",
+        "bash scripts/load_test.sh --iterations 1 exits 0 and writes the summary artifact.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 29,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-030",
+      "title": "Optional MCP server wrapper",
+      "acceptanceCriteria": [
+        "src/rlm_rs/mcp/ implements an MCP server mapping tools 1:1 to the HTTP API endpoints from plan Step 16 using httpx as a thin transport adapter.",
+        "Manual verification via an MCP client against the local API covers create session, start execution, and verify citation.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 30,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-031",
+      "title": "Optional search tool resolution backend",
+      "acceptanceCriteria": [
+        "A SearchBackend interface supports tool.queue_search and is used by orchestrator tool resolution, gated by the enable_search feature flag.",
+        "With enable_search=false, queued search requests are rejected with a clear spec error; with enable_search=true, a fake backend returns deterministic hits including doc_index, start_char, and end_char.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 31,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-032",
+      "title": "Optional search indexing and readiness gating",
+      "acceptanceCriteria": [
+        "With search enabled, ingestion indexes parsed documents and transitions PARSED to INDEXING to INDEXED; session readiness follows the plan (readiness_mode=LAX is READY after PARSED, readiness_mode=STRICT after INDEXED).",
+        "Chunking stores doc_index, start_char, and end_char per chunk with configurable defaults aligned to the plan guidance.",
+        "Search caching in S3 per spec 12.3 is verified by repeat identical search requests hitting the cache.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 32,
+      "passes": false,
+      "notes": ""
+    }
+  ]
+}

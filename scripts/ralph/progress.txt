@@ -1,0 +1,28 @@
+# Ralph Progress Log
+
+## Codebase Patterns
+- Use `UV_CACHE_DIR=/tmp/uv-cache` for `uv` commands in this sandbox to avoid cache permission errors.
+- Prefer `pydantic.JsonValue` over self-recursive JSON type aliases to avoid schema recursion errors.
+
+## Iteration Notes
+- (append entries below using the format in prompt.md)
+
+---
+
+## 2026-01-18 - US-001
+- Bootstrapped uv-based src layout with a minimal rlm_rs package and smoke test.
+- Files changed: pyproject.toml, src/rlm_rs/__init__.py, tests/test_smoke.py, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q
+- **Learnings:**
+  - Patterns discovered: uv cache needs to live in a writable location for this sandbox.
+  - Gotchas encountered: uv sync fails if cache defaults to the user cache directory.
+---
+
+## 2026-01-18 - US-002
+- What was implemented: Added core Pydantic v2 schemas for budgets, tool requests, step I/O, span refs, and API request/response bodies.
+- Files changed: pyproject.toml, src/rlm_rs/models.py, tests/unit/test_models.py, uv.lock, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q tests/unit -k models; UV_CACHE_DIR=/tmp/uv-cache uv run python -c "from rlm_rs.models import StepEvent, StepResult; print(StepEvent.model_json_schema()['title'], StepResult.model_json_schema()['title'])"
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---

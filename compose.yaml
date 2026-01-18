@@ -1,0 +1,126 @@
+x-rlm-aws-env: &rlm-aws-env
+  AWS_REGION: ${AWS_REGION:-us-east-1}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+  AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-test}
+  AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-http://localstack:4566}
+  LOCALSTACK_ENDPOINT_URL: ${LOCALSTACK_ENDPOINT_URL:-http://localstack:4566}
+  S3_BUCKET: ${S3_BUCKET:-rlm-local}
+  DDB_TABLE_PREFIX: ${DDB_TABLE_PREFIX:-rlm}
+
+services:
+  localstack:
+    image: localstack/localstack:latest
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3,dynamodb
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+      DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+    volumes:
+      - localstack-data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "awslocal", "s3", "ls"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  localstack-init:
+    image: localstack/localstack:latest
+    depends_on:
+      localstack:
+        condition: service_healthy
+    environment:
+      <<: *rlm-aws-env
+    volumes:
+      - ./scripts/localstack_init.sh:/scripts/localstack_init.sh:ro
+    entrypoint: ["bash", "/scripts/localstack_init.sh"]
+
+  rlm-parser:
+    build:
+      context: .
+      dockerfile: docker/parser.Dockerfile
+    environment:
+      <<: *rlm-aws-env
+      PARSER_HOST: ${PARSER_HOST:-0.0.0.0}
+      PARSER_PORT: ${PARSER_PORT:-8081}
+    ports:
+      - "${PARSER_PORT:-8081}:${PARSER_PORT:-8081}"
+    depends_on:
+      localstack:
+        condition: service_healthy
+      localstack-init:
+        condition: service_completed_successfully
+
+  rlm-api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    environment:
+      <<: *rlm-aws-env
+      API_HOST: ${API_HOST:-0.0.0.0}
+      API_PORT: ${API_PORT:-8080}
+      API_KEY_PEPPER: ${API_KEY_PEPPER:-smoke-pepper}
+      DEFAULT_ROOT_MODEL: ${DEFAULT_ROOT_MODEL:-fake-root}
+      DEFAULT_SUB_MODEL: ${DEFAULT_SUB_MODEL:-}
+      DEFAULT_BUDGETS_JSON: ${DEFAULT_BUDGETS_JSON:-}
+      DEFAULT_MODELS_JSON: ${DEFAULT_MODELS_JSON:-}
+      ENABLE_SEARCH_DEFAULT: ${ENABLE_SEARCH_DEFAULT:-false}
+      ENABLE_MCP: ${ENABLE_MCP:-false}
+      ENABLE_TRACE_REDACTION: ${ENABLE_TRACE_REDACTION:-false}
+    ports:
+      - "${API_PORT:-8080}:${API_PORT:-8080}"
+    depends_on:
+      localstack:
+        condition: service_healthy
+      localstack-init:
+        condition: service_completed_successfully
+
+  rlm-ingestion-worker:
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    environment:
+      <<: *rlm-aws-env
+      WORKER_MODE: ingestion
+      INGESTION_BATCH_LIMIT: ${INGESTION_BATCH_LIMIT:-10}
+      WORKER_POLL_INTERVAL_SECONDS: ${WORKER_POLL_INTERVAL_SECONDS:-0.5}
+      PARSER_SERVICE_URL: ${PARSER_SERVICE_URL:-http://rlm-parser:8081}
+      ENABLE_SEARCH_DEFAULT: ${ENABLE_SEARCH_DEFAULT:-false}
+    depends_on:
+      localstack:
+        condition: service_healthy
+      localstack-init:
+        condition: service_completed_successfully
+      rlm-parser:
+        condition: service_started
+
+  rlm-orchestrator-worker:
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    environment:
+      <<: *rlm-aws-env
+      WORKER_MODE: orchestrator
+      ORCHESTRATOR_BATCH_LIMIT: ${ORCHESTRATOR_BATCH_LIMIT:-1}
+      WORKER_POLL_INTERVAL_SECONDS: ${WORKER_POLL_INTERVAL_SECONDS:-0.5}
+      LLM_PROVIDER: ${LLM_PROVIDER:-fake}
+      DEFAULT_ROOT_MODEL: ${DEFAULT_ROOT_MODEL:-fake-root}
+      DEFAULT_SUB_MODEL: ${DEFAULT_SUB_MODEL:-}
+      DEFAULT_BUDGETS_JSON: ${DEFAULT_BUDGETS_JSON:-}
+      DEFAULT_MODELS_JSON: ${DEFAULT_MODELS_JSON:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPENAI_TIMEOUT_SECONDS: ${OPENAI_TIMEOUT_SECONDS:-}
+      OPENAI_MAX_RETRIES: ${OPENAI_MAX_RETRIES:-}
+      LLM_PROVIDER_SECRET_ARN: ${LLM_PROVIDER_SECRET_ARN:-}
+      ENABLE_SEARCH_DEFAULT: ${ENABLE_SEARCH_DEFAULT:-false}
+    depends_on:
+      localstack:
+        condition: service_healthy
+      localstack-init:
+        condition: service_completed_successfully
+
+volumes:
+  localstack-data:

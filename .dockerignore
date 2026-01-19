@@ -1,0 +1,10 @@
+.git
+.venv
+.pytest_cache
+.ruff_cache
+__pycache__/
+*.pyc
+
+ui/.next
+ui/.turbo
+ui/node_modules

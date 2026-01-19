@@ -877,12 +877,51 @@ Response (completed):
 }
 ```
 
+GET /v1/executions/{execution_id}/steps
+
+Response:
+
+```json
+{
+  "steps": [
+    {
+      "turn_index": 0,
+      "updated_at": "2025-01-01T00:00:00Z",
+      "success": true,
+      "stdout": "1\\n",
+      "state": {},
+      "span_log": [],
+      "tool_requests": {"llm": [], "search": []},
+      "final": {"is_final": false, "answer": null},
+      "error": null,
+      "checksum": "sha256:...",
+      "summary": {"byte_length": 0, "char_length": 0}
+    }
+  ]
+}
+```
+
 POST /v1/executions/{execution_id}/wait
 
 Request:
 
 ```json
 {"timeout_seconds": 30}
+```
+
+POST /v1/executions/{execution_id}/cancel
+
+Notes:
+- Idempotent. If the execution is not RUNNING, returns the current status.
+
+Response:
+
+```json
+{
+  "execution_id": "exec_...",
+  "status": "CANCELLED",
+  "completed_at": "2025-01-01T00:00:00Z"
+}
 ```
 
 ### 16.4 Runtime mode (client-driven)

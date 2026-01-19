@@ -15,6 +15,7 @@ ExecutionStatus: TypeAlias = Literal[
     "RUNNING",
     "COMPLETED",
     "FAILED",
+    "CANCELLED",
     "TIMEOUT",
     "BUDGET_EXCEEDED",
     "MAX_TURNS_EXCEEDED",
@@ -87,10 +88,25 @@ class SessionDocumentInput(RLMBaseModel):
 class SessionDocumentStatus(RLMBaseModel):
     doc_id: str
     doc_index: int
+    source_name: str
+    mime_type: str
     ingest_status: IngestStatus
     text_s3_uri: str | None = None
     meta_s3_uri: str | None = None
     offsets_s3_uri: str | None = None
+
+
+class SessionDocumentSummary(RLMBaseModel):
+    id: str
+    session_id: str
+    source_name: str
+    mime_type: str
+    raw_s3_uri: str
+    text_s3_uri: str | None = None
+    meta_s3_uri: str | None = None
+    offsets_s3_uri: str | None = None
+    text_checksum: str | None = None
+    ingest_status: IngestStatus
 
 
 class SessionReadiness(RLMBaseModel):
@@ -118,12 +134,31 @@ class CreateSessionResponse(RLMBaseModel):
 class GetSessionResponse(RLMBaseModel):
     session_id: str
     status: SessionStatus
+    created_at: str
+    expires_at: str
     readiness: SessionReadiness
     docs: list[SessionDocumentStatus]
 
 
 class DeleteSessionResponse(RLMBaseModel):
     status: Literal["DELETING"]
+
+
+class SessionListItem(RLMBaseModel):
+    id: str
+    tenant_id: str
+    status: SessionStatus
+    readiness_mode: Literal["LAX", "STRICT"]
+    docs: list[SessionDocumentSummary]
+    options: SessionOptions | None = None
+    ttl_seconds: int | None = None
+    created_at: str
+    expires_at: str
+
+
+class ListSessionsResponse(RLMBaseModel):
+    sessions: list[SessionListItem]
+    next_cursor: str | None = None
 
 
 class CreateExecutionRequest(RLMBaseModel):
@@ -150,11 +185,34 @@ class SpanRef(RLMBaseModel):
 
 class ExecutionStatusResponse(RLMBaseModel):
     execution_id: str
+    mode: ExecutionMode | None = None
     status: ExecutionStatus
     answer: str | None = None
     citations: list[SpanRef] | None = None
+    budgets_requested: Budgets | None = None
     budgets_consumed: BudgetsConsumed | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
     trace_s3_uri: str | None = None
+
+
+class ExecutionListItem(RLMBaseModel):
+    execution_id: str
+    session_id: str
+    tenant_id: str
+    mode: ExecutionMode | None = None
+    status: ExecutionStatus
+    question: str | None = None
+    answer: str | None = None
+    citations: list[SpanRef] | None = None
+    budgets_consumed: BudgetsConsumed | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+
+
+class ListExecutionsResponse(RLMBaseModel):
+    executions: list[ExecutionListItem]
+    next_cursor: str | None = None
 
 
 class ExecutionWaitRequest(RLMBaseModel):
@@ -244,6 +302,24 @@ class StepResult(RLMBaseModel):
     tool_requests: ToolRequestsEnvelope | None = None
     final: StepFinal | None = None
     error: StepError | None = None
+
+
+class ExecutionStepSnapshot(RLMBaseModel):
+    turn_index: int
+    updated_at: str | None = None
+    success: bool | None = None
+    stdout: str | None = None
+    state: StatePayload = None
+    span_log: list[SpanLogEntry] = Field(default_factory=list)
+    tool_requests: ToolRequestsEnvelope | None = None
+    final: StepFinal | None = None
+    error: StepError | None = None
+    checksum: str | None = None
+    summary: dict[str, JsonValue] | None = None
+
+
+class ExecutionStepHistoryResponse(RLMBaseModel):
+    steps: list[ExecutionStepSnapshot]
 
 
 class ContextDocument(RLMBaseModel):

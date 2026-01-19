@@ -42,11 +42,21 @@ ROOT_PROMPT_SUBCALLS_ENABLED = textwrap.dedent(
 
     2) No imports. Do not write import ...
 
-    3) No network, no files. You cannot call external APIs yourself.
+    3) No global or nonlocal statements.
 
-    4) Stdout is truncated. Print summaries and small excerpts only.
+    4) No network, no files. You cannot call external APIs yourself.
 
-    5) Budgets are real. Subcalls are expensive and can blow up fast. Use them only when you need semantic judgment.
+    5) Stdout is truncated. Print summaries and small excerpts only.
+
+    6) Budgets are real. Subcalls are expensive and can blow up fast. Use them only when you need semantic judgment.
+    7) Do not put backslashes inside f-string expressions like f"{'\\n'.join(x)}". Build those strings separately.
+
+    Sandbox legality quick reference
+    - Allowed builtins: len, range, enumerate, zip, map, any, filter, sorted, reversed, min, max, sum, abs,
+      round, int, float, str, bool, list, dict, set, tuple, isinstance, hasattr, print.
+    - Not allowed: import, open, eval, exec, globals, locals, vars, dir, help, os, sys, subprocess, socket,
+      pathlib, shutil, urllib, requests, http.
+    - Use doc.find(...) and doc.regex(...) for search. If helpers are missing, scan by slicing in chunks.
 
     How to work (required operating style)
     - Use Python first for locating regions, counting/grouping, extracting candidate spans, and storing structured notes in state["work"].
@@ -73,6 +83,12 @@ ROOT_PROMPT_SUBCALLS_ENABLED = textwrap.dedent(
     - Before stating a factual claim, ensure you have read the supporting text by slicing the relevant span.
     - If you did not read it from the documents, do not claim it as fact.
     - Prefer small, precise slices over giant dumps.
+    - Do not use doc slices as the final answer. Use them as evidence and compose a complete response.
+    - When the question asks for specific fields, extract them explicitly (for example task_name, duration,
+      delegation_result) and compose the final answer from those fields.
+    - Do not use doc slices as the final answer. Use them as evidence and compose a complete response.
+    - When the question asks for specific fields, extract them explicitly (for example task_name, duration,
+      delegation_result) and compose the final answer from those fields.
 
     Recovery behavior
     If a tool fails or returns empty:
@@ -90,7 +106,8 @@ ROOT_PROMPT_SUBCALLS_ENABLED = textwrap.dedent(
     Recommended step pattern
     - Step 1: Create state["work"]. Inspect corpus shape.
     - Step 2: Identify candidate regions. Store spans and short excerpts.
-    - Step 3: Subcall on a small set of high-value spans to extract semantics into structured fields.
+    - Step 3: Extract required fields into state["work"] (use subcalls on a small set of high-value spans
+      when needed).
     - Step 4: Verify by re-reading exact clauses and resolving contradictions.
     - Step 5: Produce final answer via tool.FINAL(...).
 
@@ -114,6 +131,15 @@ ROOT_PROMPT_SUBCALLS_ENABLED = textwrap.dedent(
 
     state["work"]["keyword_hits"] = hits[:50]
     print(f"Found {len(hits)} hits (stored first 50).")
+    ```
+
+    Regex scan without imports:
+
+    ```repl
+    doc = context[0]
+    for h in doc.regex(r"\\b\\d+%\\b", max_hits=10):
+        snippet = doc[h["start_char"]:h["end_char"]]
+        print(snippet)
     ```
 
     Queue a semantic extraction on a precise clause:
@@ -183,11 +209,21 @@ ROOT_PROMPT_SUBCALLS_DISABLED = textwrap.dedent(
 
     2) No imports. Do not write import ...
 
-    3) No network, no files. You cannot call external APIs yourself.
+    3) No global or nonlocal statements.
 
-    4) Stdout is truncated. Print summaries and small excerpts only.
+    4) No network, no files. You cannot call external APIs yourself.
 
-    5) Budgets are real. Use tools only when you need to.
+    5) Stdout is truncated. Print summaries and small excerpts only.
+
+    6) Budgets are real. Use tools only when you need to.
+    7) Do not put backslashes inside f-string expressions like f"{'\\n'.join(x)}". Build those strings separately.
+
+    Sandbox legality quick reference
+    - Allowed builtins: len, range, enumerate, zip, map, any, filter, sorted, reversed, min, max, sum, abs,
+      round, int, float, str, bool, list, dict, set, tuple, isinstance, hasattr, print.
+    - Not allowed: import, open, eval, exec, globals, locals, vars, dir, help, os, sys, subprocess, socket,
+      pathlib, shutil, urllib, requests, http.
+    - Use doc.find(...) and doc.regex(...) for search. If helpers are missing, scan by slicing in chunks.
 
     How to work (required operating style)
     - Use Python for locating regions, counting/grouping, extracting candidate spans, and storing structured notes in state["work"].
@@ -212,6 +248,9 @@ ROOT_PROMPT_SUBCALLS_DISABLED = textwrap.dedent(
     - Before stating a factual claim, ensure you have read the supporting text by slicing the relevant span.
     - If you did not read it from the documents, do not claim it as fact.
     - Prefer small, precise slices over giant dumps.
+    - Do not use doc slices as the final answer. Use them as evidence and compose a complete response.
+    - When the question asks for specific fields, extract them explicitly (for example task_name, duration,
+      delegation_result) and compose the final answer from those fields.
 
     Recovery behavior
     If a tool fails or returns empty:
@@ -229,8 +268,9 @@ ROOT_PROMPT_SUBCALLS_DISABLED = textwrap.dedent(
     Recommended step pattern
     - Step 1: Create state["work"]. Inspect corpus shape.
     - Step 2: Identify candidate regions. Store spans and short excerpts.
-    - Step 3: Verify by re-reading exact clauses and resolving contradictions.
-    - Step 4: Produce final answer via tool.FINAL(...).
+    - Step 3: Extract required fields into state["work"] using slicing and regex.
+    - Step 4: Verify by re-reading exact clauses and resolving contradictions.
+    - Step 5: Produce final answer via tool.FINAL(...).
 
     Examples you may emulate (not mandatory)
 

@@ -57,10 +57,10 @@ def test_ddb_s3_roundtrip() -> None:
     _ensure_bucket(s3_client, bucket)
     tables = _ensure_tables(ddb_client, prefix)
 
-    tenant_id = "tenant-1"
-    session_id = "sess-1"
-    doc_id = "doc-1"
-    execution_id = "exec-1"
+    tenant_id = "tenant-ddb-s3"
+    session_id = "sess-ddb-s3"
+    doc_id = "doc-ddb-s3"
+    execution_id = "exec-ddb-s3"
     ttl_epoch = int(datetime(2026, 1, 2, tzinfo=timezone.utc).timestamp())
 
     s3_key = "parsed/test/text.json"

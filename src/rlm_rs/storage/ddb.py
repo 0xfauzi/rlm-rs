@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 import boto3
+from boto3.dynamodb.conditions import Key
 from boto3.resources.base import ServiceResource
 from botocore.client import BaseClient
 from botocore.exceptions import ClientError
@@ -18,6 +20,7 @@ EXECUTION_PK_PREFIX = "SESSION#"
 EXECUTION_SK_PREFIX = "EXEC#"
 EXECUTION_STATE_PK_PREFIX = "EXEC#"
 EXECUTION_STATE_SK = "STATE"
+EXECUTION_STATE_STEP_SK_PREFIX = "STATE#"
 
 
 @dataclass(frozen=True)
@@ -100,12 +103,30 @@ def execution_state_key(execution_id: str) -> dict[str, str]:
     return {"PK": f"{EXECUTION_STATE_PK_PREFIX}{execution_id}", "SK": EXECUTION_STATE_SK}
 
 
+def execution_state_step_key(execution_id: str, turn_index: int) -> dict[str, str]:
+    return {
+        "PK": f"{EXECUTION_STATE_PK_PREFIX}{execution_id}",
+        "SK": f"{EXECUTION_STATE_STEP_SK_PREFIX}{turn_index}",
+    }
+
+
 def _without_none(item: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in item.items() if value is not None}
 
 
 def _conditional_failed(err: ClientError) -> bool:
     return err.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException"
+
+
+def _coerce_decimals(value: Any) -> Any:
+    """Convert floats to Decimal recursively for DynamoDB compatibility."""
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if isinstance(value, dict):
+        return {k: _coerce_decimals(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_coerce_decimals(v) for v in value]
+    return value
 
 
 def create_session(
@@ -452,13 +473,70 @@ def put_execution_state(
             "error": error,
         }
     )
-    table.put_item(Item=item)
+    table.put_item(Item=_coerce_decimals(item))
+    return item
+
+
+def put_execution_state_step(
+    table: Any,
+    *,
+    execution_id: str,
+    turn_index: int,
+    updated_at: str,
+    ttl_epoch: int,
+    state_json: JsonValue | None = None,
+    state_s3_uri: str | None = None,
+    checksum: str | None = None,
+    summary: dict[str, JsonValue] | None = None,
+    success: bool | None = None,
+    stdout: str | None = None,
+    span_log: list[dict[str, JsonValue]] | None = None,
+    tool_requests: dict[str, JsonValue] | None = None,
+    final: dict[str, JsonValue] | None = None,
+    error: dict[str, JsonValue] | None = None,
+) -> dict[str, Any]:
+    item = _without_none(
+        {
+            **execution_state_step_key(execution_id, turn_index),
+            "execution_id": execution_id,
+            "turn_index": turn_index,
+            "updated_at": updated_at,
+            "ttl_epoch": ttl_epoch,
+            "state_json": state_json,
+            "state_s3_uri": state_s3_uri,
+            "checksum": checksum,
+            "summary": summary,
+            "success": success,
+            "stdout": stdout,
+            "span_log": span_log,
+            "tool_requests": tool_requests,
+            "final": final,
+            "error": error,
+        }
+    )
+    table.put_item(Item=_coerce_decimals(item))
     return item
 
 
 def get_execution_state(table: Any, *, execution_id: str) -> dict[str, Any] | None:
     response = table.get_item(Key=execution_state_key(execution_id))
     return response.get("Item")
+
+
+def list_execution_state_steps(table: Any, *, execution_id: str) -> list[dict[str, Any]]:
+    key_condition = Key("PK").eq(f"{EXECUTION_STATE_PK_PREFIX}{execution_id}") & Key(
+        "SK"
+    ).begins_with(EXECUTION_STATE_STEP_SK_PREFIX)
+    items: list[dict[str, Any]] = []
+    response = table.query(KeyConditionExpression=key_condition)
+    items.extend(response.get("Items", []))
+    while response.get("LastEvaluatedKey"):
+        response = table.query(
+            KeyConditionExpression=key_condition,
+            ExclusiveStartKey=response["LastEvaluatedKey"],
+        )
+        items.extend(response.get("Items", []))
+    return items
 
 
 def acquire_execution_lease(

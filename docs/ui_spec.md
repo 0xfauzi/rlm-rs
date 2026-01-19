@@ -152,6 +152,9 @@ Right panel:
   - `Doc <index> · <start>-<end> · <checksum>`
   - Button: `Inspect`
 - Trace pointer (when enabled)
+- Step history panel
+  - Turn timeline with status badges
+  - Stdout, state, span log, tool requests, final, and error payloads
 
 Behavior:
 - Poll every 2 seconds while RUNNING.
@@ -211,7 +214,7 @@ Table:
 - Mode (Answerer/Runtime)
 - Status
 - Started/Completed timestamps
-- Action: `Open`
+- Actions: `Open`, `Cancel` (when RUNNING)
 
 Filters:
 - Status filter
@@ -240,10 +243,13 @@ Session:
 Answerer:
 - `POST /v1/sessions/{session_id}/executions`
 - `GET /v1/executions/{execution_id}`
+- `GET /v1/executions/{execution_id}/steps`
+- `POST /v1/executions/{execution_id}/cancel`
 
 Runtime:
 - `POST /v1/sessions/{session_id}/executions/runtime`
 - `POST /v1/executions/{execution_id}/steps`
+- `POST /v1/executions/{execution_id}/cancel`
 
 Citations:
 - `POST /v1/spans/get`

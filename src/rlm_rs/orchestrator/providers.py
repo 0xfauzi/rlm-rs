@@ -4,6 +4,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import json
 from typing import Any, Iterable, Protocol
 
 from botocore.client import BaseClient
@@ -15,8 +16,10 @@ from openai import (
     OpenAI,
     RateLimitError,
 )
+from structlog.stdlib import BoundLogger
 from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_exponential
 
+from rlm_rs.logging import get_logger
 from rlm_rs.storage import s3
 
 
@@ -270,6 +273,80 @@ def _should_retry_openai(exc: BaseException) -> bool:
     return False
 
 
+def _uses_max_completion_tokens(model: str | None) -> bool:
+    if not model:
+        return False
+    normalized = model.lower()
+    if normalized.startswith("gpt-5"):
+        return True
+    if normalized.startswith("o") and len(normalized) > 1 and normalized[1].isdigit():
+        return True
+    return False
+
+
+def _openai_error_payload(exc: BaseException) -> dict[str, Any] | None:
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        return body
+    if isinstance(body, (str, bytes)):
+        try:
+            parsed = json.loads(body)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    json_method = getattr(response, "json", None)
+    if not callable(json_method):
+        return None
+    try:
+        payload = json_method()
+    except Exception:  # noqa: BLE001
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _wants_max_completion_tokens(exc: BaseException) -> bool:
+    payload = _openai_error_payload(exc)
+    if payload:
+        error = payload.get("error")
+        if isinstance(error, dict):
+            param = error.get("param")
+            code = error.get("code")
+            message = error.get("message")
+            if param == "max_tokens" and code == "unsupported_parameter":
+                return True
+            if isinstance(message, str) and "max_completion_tokens" in message:
+                return True
+    text = str(exc)
+    return "max_completion_tokens" in text and "max_tokens" in text
+
+
+def _wants_default_temperature(exc: BaseException) -> bool:
+    payload = _openai_error_payload(exc)
+    if payload:
+        error = payload.get("error")
+        if isinstance(error, dict):
+            param = error.get("param")
+            code = error.get("code")
+            message = error.get("message")
+            if param == "temperature" and code in {
+                "unsupported_value",
+                "invalid_value",
+                "unsupported_parameter",
+            }:
+                return True
+            if isinstance(message, str) and "temperature" in message.lower():
+                if "only the default" in message.lower():
+                    return True
+    text = str(exc).lower()
+    return "temperature" in text and "only the default" in text
+
+
 class OpenAIProvider:
     def __init__(
         self,
@@ -282,6 +359,7 @@ class OpenAIProvider:
         s3_client: BaseClient | None = None,
         s3_bucket: str | None = None,
         cache_prefix: str = DEFAULT_LLM_CACHE_PREFIX,
+        logger: BoundLogger | None = None,
     ) -> None:
         if timeout_seconds is None:
             timeout_seconds = DEFAULT_OPENAI_TIMEOUT_SECONDS
@@ -301,6 +379,7 @@ class OpenAIProvider:
             )
         self._client = client
         self._max_retries = max_retries
+        self._logger = logger or get_logger("rlm_rs.llm")
         self._cache = None
         if s3_client is not None and s3_bucket is not None:
             self._cache = S3LLMCache(s3_client, s3_bucket, prefix=cache_prefix)
@@ -312,7 +391,20 @@ class OpenAIProvider:
         *,
         tenant_id: str | None = None,
     ) -> str:
-        return self._chat_completion(prompt, model, max_tokens=None, temperature=None)
+        text, raw = self._chat_completion_with_meta(
+            prompt,
+            model,
+            max_tokens=None,
+            temperature=None,
+        )
+        self._log_completion(
+            call_kind="root",
+            model=model,
+            text=text,
+            raw=raw,
+            tenant_id=tenant_id,
+        )
+        return text
 
     def complete_subcall(
         self,
@@ -354,6 +446,34 @@ class OpenAIProvider:
             )
         return text
 
+    def _log_completion(
+        self,
+        *,
+        call_kind: str,
+        model: str | None,
+        text: str,
+        raw: dict[str, Any],
+        tenant_id: str | None,
+    ) -> None:
+        if self._logger is None:
+            return
+        payload: dict[str, Any] = {
+            "call_kind": call_kind,
+            "model": model,
+            "output_chars": len(text),
+        }
+        finish_reason = raw.get("finish_reason")
+        if isinstance(finish_reason, str) and finish_reason:
+            payload["finish_reason"] = finish_reason
+        usage = raw.get("usage")
+        if isinstance(usage, dict):
+            completion_tokens = usage.get("completion_tokens")
+            if completion_tokens is not None:
+                payload["completion_tokens"] = completion_tokens
+        if tenant_id:
+            payload["tenant_id"] = tenant_id
+        self._logger.info("llm_completion", **payload)
+
     def _chat_completion(
         self,
         prompt: str,
@@ -381,22 +501,44 @@ class OpenAIProvider:
         if not model:
             raise ValueError("model is required for OpenAI provider")
 
-        def _call() -> Any:
-            payload: dict[str, Any] = {
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-            }
-            if max_tokens is not None:
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if max_tokens is not None:
+            if _uses_max_completion_tokens(model):
+                payload["max_completion_tokens"] = max_tokens
+            else:
                 payload["max_tokens"] = max_tokens
-            if temperature is not None:
-                payload["temperature"] = temperature
-            return self._client.chat.completions.create(**payload)
+        if temperature is not None:
+            payload["temperature"] = temperature
 
-        response = self._with_retries(_call)
+        def _call(request_payload: dict[str, Any]) -> Any:
+            return self._client.chat.completions.create(**request_payload)
+
+        try:
+            response = self._with_retries(lambda: _call(payload))
+        except APIStatusError as exc:
+            retry_payload = dict(payload)
+            retry = False
+            if max_tokens is not None and _wants_max_completion_tokens(exc):
+                if "max_tokens" in retry_payload:
+                    retry_payload.pop("max_tokens", None)
+                    retry_payload["max_completion_tokens"] = max_tokens
+                    retry = True
+            if _wants_default_temperature(exc) and "temperature" in retry_payload:
+                retry_payload.pop("temperature", None)
+                retry = True
+            if not retry:
+                raise
+            response = self._with_retries(lambda: _call(retry_payload))
         text = ""
+        finish_reason: str | None = None
         choices = getattr(response, "choices", None)
         if choices:
-            message = getattr(choices[0], "message", None)
+            choice = choices[0]
+            finish_reason = getattr(choice, "finish_reason", None)
+            message = getattr(choice, "message", None)
             content = getattr(message, "content", None)
             if isinstance(content, str):
                 text = content
@@ -404,6 +546,17 @@ class OpenAIProvider:
         response_id = getattr(response, "id", None)
         if response_id:
             raw["id"] = response_id
+        if isinstance(finish_reason, str) and finish_reason:
+            raw["finish_reason"] = finish_reason
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            usage_payload: dict[str, Any] = {}
+            for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                value = getattr(usage, field, None)
+                if value is not None:
+                    usage_payload[field] = value
+            if usage_payload:
+                raw["usage"] = usage_payload
         return text, raw
 
     def _with_retries(self, func: Any) -> Any:

@@ -1,6 +1,7 @@
 # AGENTS
 
 This file is the local guide for coding agents working on rlm-rs.
+Do not attempt to commit to git.
 
 ## Project overview
 - RLM-RS implements the Recursive Language Model Runtime Service with API, orchestrator, ingestion, sandbox, parser, and storage components.
@@ -18,6 +19,10 @@ This file is the local guide for coding agents working on rlm-rs.
 - Local AWS primitives use LocalStack. Use `.env.example` and `compose.yaml` as the source of defaults.
 - Settings are defined in `src/rlm_rs/settings.py` and should stay in sync with `.env.example`.
 
+## UI patterns
+- Next.js pages that call `useSearchParams` must wrap the client component in a `Suspense` boundary to avoid build-time prerender errors.
+
+
 ## Common commands
 - `uv sync`
 - `uv run pytest -q`
@@ -29,6 +34,7 @@ This file is the local guide for coding agents working on rlm-rs.
 ## LocalStack and init
 - `scripts/localstack_init.sh` creates the S3 bucket and DynamoDB tables.
 - Integration tests skip when LocalStack is unavailable. Start it before running them.
+- If LocalStack state persists between runs, set `DDB_TABLE_PREFIX` to a unique value to avoid conditional write collisions in integration tests.
 
 ## Change checklists
 - Adding env vars: update `src/rlm_rs/settings.py`, `.env.example`, and `compose.yaml`.

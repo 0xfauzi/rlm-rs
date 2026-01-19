@@ -2,6 +2,8 @@
 
 ## Codebase Patterns
 - Use `UV_CACHE_DIR=/tmp/uv-cache` for `uv` commands in this sandbox to avoid cache permission errors.
+- Use `NPM_CONFIG_CACHE=/tmp/npm-cache` for npm commands in this sandbox to avoid cache permission errors.
+- If LocalStack state persists, set a unique `DDB_TABLE_PREFIX` for integration tests to avoid conditional write collisions.
 - Prefer `pydantic.JsonValue` over self-recursive JSON type aliases to avoid schema recursion errors.
 - API keys use HMAC-SHA256 with `API_KEY_PEPPER` and DDB PK/SK format `KEY#<hash>`.
 - In FastAPI tests, override `get_settings` with `lambda: Settings()` to avoid Pydantic BaseSettings dependency resolution errors.
@@ -18,6 +20,7 @@
 - MCP server wrapper lives in `rlm_rs.mcp` and reads `RLM_BASE_URL` and `RLM_API_KEY` from env.
 - Search tool resolution uses `SearchBackend`; disabled search records a spec-style error in tool results.
 - Search indexing uses `SEARCH_BACKEND_CONFIG` with `chunk_size_chars`, `chunk_overlap_chars`, and `index_prefix`, and caches search results under `cache/{tenant_id}/search/{sha256}.json` (configurable via `cache_prefix`).
+- Next.js pages that call `useSearchParams` must wrap the client component in a `Suspense` boundary to avoid build-time prerender errors.
 
 ## Iteration Notes
 - (append entries below using the format in prompt.md)
@@ -279,5 +282,207 @@
 - Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q
 - **Learnings:**
   - Patterns discovered: Search indexing/caching configuration lives in SEARCH_BACKEND_CONFIG with chunk sizing and prefix controls.
+  - Gotchas encountered: none
+---
+## 2026-01-18 - US-033
+- What was implemented: Bootstrapped Next.js UI app with TypeScript, Tailwind, ESLint, strict tsconfig, and placeholder homepage; adjusted integration tests to use unique IDs to avoid DDB collisions during LocalStack runs.
+- Files changed: ui/package.json, ui/tsconfig.json, ui/.eslintrc.json, ui/eslint.config.mjs, ui/src/app/page.tsx, tests/integration/test_ddb_s3_roundtrip.py, tests/integration/test_orchestrator_answerer.py, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run lint --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run build --prefix ui; UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q; NPM_CONFIG_CACHE=/tmp/npm-cache npm run dev --prefix ui -- --hostname 127.0.0.1 --port 3000; curl -sS http://127.0.0.1:3000
+- **Learnings:**
+  - Patterns discovered: npm cache needs to live in a writable location for this sandbox.
+  - Gotchas encountered: none
+---
+## 2026-01-18 - US-034
+- What was implemented: Added shared UI TypeScript types, ApiClient with error handling, LocalStack-aware S3/DDB helpers, and config defaults; added AWS SDK deps.
+- Files changed: AGENTS.md, ui/package.json, ui/package-lock.json, ui/src/lib/types.ts, ui/src/lib/api-client.ts, ui/src/lib/config.ts, ui/src/lib/s3-client.ts, ui/src/lib/ddb-client.ts, ui/src/lib/crypto.ts, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run lint --prefix ui; UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q; docker compose build rlm-ui (fails: buildx activity permission error)
+- **Learnings:**
+  - Patterns discovered: LocalStack integration tests can avoid stale data by overriding `DDB_TABLE_PREFIX`.
+  - Gotchas encountered: none
+---
+## 2026-01-18 - US-035
+- What was implemented: Added toast UI and provider plus AppContext with health polling, configurable settings, and running execution count tracking.
+- Files changed: ui/src/components/ui/toast.tsx, ui/src/contexts/ToastContext.tsx, ui/src/contexts/AppContext.tsx, ui/src/app/layout.tsx, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q; NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run lint --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run build --prefix ui
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-18 - US-036
+- What was implemented: Added AppShell layout with top bar and sidebar navigation, health badges, running execution count, and mobile sidebar toggle; refreshed homepage content to fit the shell.
+- Files changed: ui/src/components/layout/AppShell.tsx, ui/src/components/layout/Sidebar.tsx, ui/src/components/layout/TopBar.tsx, ui/src/app/layout.tsx, ui/src/app/page.tsx, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run lint --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run build --prefix ui; UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-19 - US-037
+- What was implemented: Added auto-seed hook and seed helpers for LocalStack API keys plus a crypto hash test and layout wiring.
+- Files changed: ui/src/lib/seed.ts, ui/src/hooks/useAutoSeed.ts, ui/src/components/layout/AutoSeed.tsx, ui/src/app/layout.tsx, ui/src/lib/crypto.test.ts, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q; NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run lint --prefix ui
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-19 - US-038
+- What was implemented: Added Sessions page with upload form, progress-aware S3 upload, session creation flow, and sessions table with loading and empty states.
+- Files changed: ui/src/app/sessions/page.tsx, ui/src/lib/api-client.ts, ui/src/lib/s3-client.ts, ui/src/lib/types.ts, ui/package.json, ui/package-lock.json, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run lint --prefix ui; UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-19 - US-039
+- What was implemented: Added session detail screen with status header, polling, doc table, parsed text drawer, and placeholder start modals; expanded session API response to include created/expires timestamps and doc metadata needed by the UI.
+- Files changed: src/rlm_rs/models.py, src/rlm_rs/api/sessions.py, ui/src/lib/types.ts, ui/src/app/sessions/[session_id]/page.tsx, ui/src/components/modals/StartAnswererModal.tsx, ui/src/components/modals/StartRuntimeModal.tsx, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q; NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run lint --prefix ui
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-19 - US-040
+- What was implemented: Replaced the Answerer start modal with full form submission flow and added the Answerer execution detail page with status, budgets, answer, and citations views.
+- Files changed: ui/src/components/modals/StartAnswererModal.tsx, ui/src/app/sessions/[session_id]/page.tsx, ui/src/app/executions/[execution_id]/page.tsx, ui/src/lib/types.ts, src/rlm_rs/models.py, src/rlm_rs/api/executions.py, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q; NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run lint --prefix ui
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-19 - US-041
+- What was implemented: Built the runtime execution editor with multi-step editing, run controls, output inspector tabs, and wired runtime start/reset flows.
+- Files changed: ui/src/components/modals/StartRuntimeModal.tsx, ui/src/app/sessions/[session_id]/page.tsx, ui/src/app/executions/[execution_id]/runtime/page.tsx, ui/src/lib/types.ts, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q; NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run lint --prefix ui
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-19 - US-042
+- What was implemented: Added the Citation Viewer screen with query-param parsing, metadata display, excerpt highlighting with adjustable context, and citation verification feedback.
+- Files changed: ui/src/app/citations/page.tsx, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run lint --prefix ui; UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-19 - US-043
+- What was implemented: Added the executions list screen with filters, pagination, auto-refresh, and local execution tracking for Answerer/Runtime starts.
+- Files changed: ui/src/app/executions/page.tsx, ui/src/lib/executions-store.ts, ui/src/components/modals/StartAnswererModal.tsx, ui/src/components/modals/StartRuntimeModal.tsx, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run lint --prefix ui; UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-19 - US-044
+- What was implemented: Added the Debug Console screen with health panels, request/error logs, and editable configuration plus ApiClient request logging.
+- Files changed: ui/src/app/debug/page.tsx, ui/src/lib/request-log.ts, ui/src/lib/api-client.ts, ui/src/lib/ddb-client.ts, ui/src/contexts/AppContext.tsx, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run lint --prefix ui; UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+
+## 2026-01-19 - US-045
+- What was implemented: Added shared Skeleton and EmptyState components, standardized API error panels, and wired error boundaries plus Next.js error/not-found pages with Suspense wrappers for search-param pages.
+- Files changed: AGENTS.md, scripts/ralph/prd.json, scripts/ralph/progress.txt, ui/src/components/ui/Skeleton.tsx, ui/src/components/ui/EmptyState.tsx, ui/src/components/ui/ErrorPanel.tsx, ui/src/components/ErrorBoundary.tsx, ui/src/components/layout/AppShell.tsx, ui/src/app/error.tsx, ui/src/app/not-found.tsx, ui/src/app/sessions/page.tsx, ui/src/app/sessions/[session_id]/page.tsx, ui/src/app/executions/[execution_id]/page.tsx, ui/src/app/executions/page.tsx, ui/src/app/executions/ExecutionsPageClient.tsx, ui/src/app/debug/page.tsx, ui/src/app/citations/page.tsx, ui/src/app/citations/CitationsPageClient.tsx
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q; NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run lint --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run build --prefix ui
+- **Learnings:**
+  - Patterns discovered: Next.js pages that call useSearchParams must be wrapped in Suspense via a server wrapper to avoid build-time prerender errors.
+  - Gotchas encountered: pytest integration tests can fail if DDB_TABLE_PREFIX is not unique.
+---
+## 2026-01-19 - US-046
+- What was implemented: Added UI Dockerfile, enabled Next.js standalone output, and wired rlm-ui into docker compose.
+- Files changed: compose.yaml, docker/ui.Dockerfile, ui/next.config.js, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run lint --prefix ui; UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-19 - US-047
+- What was implemented: Added Playwright MCP server config, E2E screenshots directory, and a runner script that boots the UI dev server and executes E2E scripts.
+- Files changed: .claude/settings.local.json, scripts/e2e/run-e2e-tests.sh, ui/tests/e2e/screenshots/.gitkeep, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q; NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run lint --prefix ui
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-19 - US-048
+- What was implemented: Documented Playwright MCP E2E steps for app shell and navigation checks.
+- Files changed: scripts/e2e/test-app-shell.md, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-19 - US-049
+- What was implemented: Documented Playwright MCP E2E steps for session creation and added the test fixture document.
+- Files changed: scripts/e2e/test-sessions.md, ui/tests/e2e/fixtures/test-doc.txt, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q; NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-19 - US-050
+- What was implemented: Documented Playwright MCP E2E steps for Answerer execution flow including screenshots and citation verification.
+- Files changed: scripts/e2e/test-answerer.md, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q; NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-19 - US-051
+- What was implemented: Documented Playwright MCP E2E steps for Runtime multi-step execution flow with screenshots and assertions.
+- Files changed: scripts/e2e/test-runtime.md, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-19 - US-052
+- What was implemented: Documented Playwright MCP E2E steps for the Debug Console screen, including screenshots and assertions.
+- Files changed: scripts/e2e/test-debug.md, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+
+## 2026-01-19 - US-053
+- What was implemented: Documented Playwright MCP E2E steps for the Executions list filters and navigation checks.
+- Files changed: scripts/e2e/test-executions-list.md, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-19 - US-054
+- What was implemented: Documented Playwright MCP E2E steps for responsive layout checks with required screenshots.
+- Files changed: scripts/e2e/test-responsive.md, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q; NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-19 - US-055
+- What was implemented: Added UI smoke test script to boot compose services, wait for API/UI health, and list E2E screenshots; documented ordered Playwright MCP test checklist.
+- Files changed: scripts/ui_smoke_test.sh, scripts/e2e/run-all-tests.md, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q; NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-19 - US-056
+- What was implemented: Added /v1/executions list endpoint with filtering and cursor pagination plus unit and LocalStack integration coverage.
+- Files changed: src/rlm_rs/models.py, src/rlm_rs/api/executions.py, tests/unit/test_api_executions.py, tests/integration/test_list_executions_api.py, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q tests/unit -k list_executions; UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q tests/integration -k list_executions
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-19 - US-057
+- What was implemented: Added GET /v1/sessions with cursor pagination, status filtering, and session list models plus unit coverage.
+- Files changed: src/rlm_rs/models.py, src/rlm_rs/api/sessions.py, tests/unit/test_api_sessions.py, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q
+- **Learnings:**
+  - Patterns discovered: none
   - Gotchas encountered: none
 ---

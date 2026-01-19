@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import time
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -8,7 +11,7 @@ from uuid import uuid4
 
 from boto3.resources.base import ServiceResource
 from botocore.client import BaseClient
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from pydantic import JsonValue
 from structlog.stdlib import BoundLogger
 
@@ -32,9 +35,14 @@ from rlm_rs.models import (
     CreateExecutionResponse,
     CreateRuntimeExecutionResponse,
     ExecutionOptions,
+    ExecutionStepHistoryResponse,
+    ExecutionStepSnapshot,
+    ExecutionStatus,
     ExecutionStatusResponse,
     ExecutionWaitRequest,
+    ExecutionListItem,
     LimitsSnapshot,
+    ListExecutionsResponse,
     LLMToolResult,
     ModelsConfig,
     SearchToolResult,
@@ -47,6 +55,7 @@ from rlm_rs.models import (
     ToolResolveResponse,
     ToolResultsEnvelope,
 )
+from rlm_rs.search import search_disabled_error_meta
 from rlm_rs.settings import Settings
 from rlm_rs.sandbox.step_executor import execute_step
 from rlm_rs.storage import ddb, s3, state as state_store
@@ -69,6 +78,31 @@ def _format_timestamp(value: datetime) -> str:
 
 def _new_execution_id() -> str:
     return f"{_EXECUTION_PREFIX}{uuid4().hex}"
+
+
+def _encode_cursor(key: Mapping[str, Any]) -> str:
+    payload = json.dumps(
+        {"PK": key.get("PK"), "SK": key.get("SK")},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_cursor(cursor: str) -> dict[str, str]:
+    padding = "=" * (-len(cursor) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(cursor + padding)
+        data = json.loads(raw.decode("utf-8"))
+    except (binascii.Error, json.JSONDecodeError, UnicodeDecodeError):
+        raise_http_error(ErrorCode.VALIDATION_ERROR, "Invalid cursor")
+    if not isinstance(data, dict):
+        raise_http_error(ErrorCode.VALIDATION_ERROR, "Invalid cursor")
+    pk = data.get("PK")
+    sk = data.get("SK")
+    if not isinstance(pk, str) or not isinstance(sk, str):
+        raise_http_error(ErrorCode.VALIDATION_ERROR, "Invalid cursor")
+    return {"PK": pk, "SK": sk}
 
 
 def _serialize_model(
@@ -167,6 +201,7 @@ def _load_state_payload(
             state_json = s3.get_gzip_json(s3_client, bucket, key)
         except Exception as exc:  # noqa: BLE001
             raise_http_error(ErrorCode.S3_READ_ERROR, f"Failed to read state: {exc}")
+    state_json = state_store.normalize_json_value(state_json)
     try:
         state_store.validate_state_payload(state_json)
     except state_store.StateValidationError as exc:
@@ -270,6 +305,10 @@ def _resolve_tool_requests(
 
     for tool_request in request.tool_requests.search:
         if not enable_search:
+            results.search[tool_request.key] = SearchToolResult(
+                hits=[],
+                meta=search_disabled_error_meta(),
+            )
             statuses[tool_request.key] = "error"
             continue
         results.search[tool_request.key] = SearchToolResult(
@@ -292,6 +331,44 @@ def _scan_execution_items(table: Any, execution_id: str) -> list[dict[str, Any]]
     return [item for item in items if item.get("SK") == target_sk]
 
 
+def _scan_executions(
+    table: Any,
+    *,
+    tenant_id: str,
+    status: ExecutionStatus | None,
+    mode: str | None,
+    session_prefix: str | None,
+    limit: int,
+    start_key: dict[str, str] | None,
+) -> tuple[list[dict[str, Any]], dict[str, str] | None]:
+    items: list[dict[str, Any]] = []
+    last_key = start_key
+    while len(items) < limit:
+        scan_params: dict[str, Any] = {"Limit": limit}
+        if last_key is not None:
+            scan_params["ExclusiveStartKey"] = last_key
+        response = table.scan(**scan_params)
+        batch = response.get("Items", [])
+        for item in batch:
+            if item.get("tenant_id") != tenant_id:
+                continue
+            if status and item.get("status") != status:
+                continue
+            if mode and item.get("mode") != mode:
+                continue
+            if session_prefix:
+                session_id = str(item.get("session_id", ""))
+                if not session_id.startswith(session_prefix):
+                    continue
+            items.append(item)
+            if len(items) >= limit:
+                break
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key or len(items) >= limit:
+            break
+    return items, last_key
+
+
 def _get_execution_for_tenant(
     table: Any, execution_id: str, tenant_id: str
 ) -> dict[str, Any]:
@@ -311,11 +388,31 @@ def _build_execution_response(item: Mapping[str, Any]) -> ExecutionStatusRespons
         return_trace = options.get("return_trace") is True
     return ExecutionStatusResponse(
         execution_id=str(item["execution_id"]),
+        mode=item.get("mode"),
         status=str(item["status"]),
         answer=item.get("answer"),
         citations=item.get("citations"),
+        budgets_requested=item.get("budgets_requested"),
         budgets_consumed=item.get("budgets_consumed"),
+        started_at=item.get("started_at"),
+        completed_at=item.get("completed_at"),
         trace_s3_uri=item.get("trace_s3_uri") if return_trace else None,
+    )
+
+
+def _build_execution_list_item(item: Mapping[str, Any]) -> ExecutionListItem:
+    return ExecutionListItem(
+        execution_id=str(item["execution_id"]),
+        session_id=str(item["session_id"]),
+        tenant_id=str(item["tenant_id"]),
+        mode=item.get("mode"),
+        status=str(item["status"]),
+        question=item.get("question"),
+        answer=item.get("answer"),
+        citations=item.get("citations"),
+        budgets_consumed=item.get("budgets_consumed"),
+        started_at=item.get("started_at"),
+        completed_at=item.get("completed_at"),
     )
 
 
@@ -461,6 +558,157 @@ def get_execution(
     )
 
     return _build_execution_response(item)
+
+
+@router.post("/executions/{execution_id}/cancel", response_model=ExecutionStatusResponse)
+def cancel_execution(
+    execution_id: str,
+    context: ApiKeyContext = Depends(require_api_key),
+    ddb_resource: ServiceResource = Depends(get_ddb_resource),
+    table_names: DdbTableNames = Depends(get_table_names),
+    logger: BoundLogger = Depends(get_logger),
+) -> ExecutionStatusResponse:
+    executions_table = ddb_resource.Table(table_names.executions)
+    item = _get_execution_for_tenant(executions_table, execution_id, context.tenant_id)
+    ensure_tenant_access(item, context.tenant_id)
+
+    status = str(item.get("status") or "")
+    if status != "RUNNING":
+        logger.info(
+            "executions.cancel",
+            tenant_id=context.tenant_id,
+            session_id=item.get("session_id"),
+            execution_id=execution_id,
+            status=status,
+            cancelled=False,
+        )
+        return _build_execution_response(item)
+
+    session_id = str(item.get("session_id") or "")
+    if not session_id:
+        raise_http_error(ErrorCode.EXECUTION_NOT_FOUND, "Execution not found")
+
+    updated = ddb.update_execution_status(
+        executions_table,
+        session_id=session_id,
+        execution_id=execution_id,
+        expected_status="RUNNING",
+        new_status="CANCELLED",
+        completed_at=_format_timestamp(_utc_now()),
+    )
+    if not updated:
+        item = _get_execution_for_tenant(executions_table, execution_id, context.tenant_id)
+        ensure_tenant_access(item, context.tenant_id)
+        return _build_execution_response(item)
+
+    item = ddb.get_execution(executions_table, session_id=session_id, execution_id=execution_id)
+    if item is None:
+        raise_http_error(ErrorCode.EXECUTION_NOT_FOUND, "Execution not found")
+
+    logger.info(
+        "executions.cancel",
+        tenant_id=context.tenant_id,
+        session_id=session_id,
+        execution_id=execution_id,
+        status="CANCELLED",
+        cancelled=True,
+    )
+
+    return _build_execution_response(item)
+
+
+@router.get("/executions/{execution_id}/steps", response_model=ExecutionStepHistoryResponse)
+def get_execution_steps(
+    execution_id: str,
+    context: ApiKeyContext = Depends(require_api_key),
+    ddb_resource: ServiceResource = Depends(get_ddb_resource),
+    table_names: DdbTableNames = Depends(get_table_names),
+    s3_client: BaseClient = Depends(get_s3_client),
+    logger: BoundLogger = Depends(get_logger),
+) -> ExecutionStepHistoryResponse:
+    executions_table = ddb_resource.Table(table_names.executions)
+    item = _get_execution_for_tenant(executions_table, execution_id, context.tenant_id)
+    ensure_tenant_access(item, context.tenant_id)
+
+    execution_state_table = ddb_resource.Table(table_names.execution_state)
+    state_items = ddb.list_execution_state_steps(
+        execution_state_table,
+        execution_id=execution_id,
+    )
+    steps: list[ExecutionStepSnapshot] = []
+    for state_item in state_items:
+        state_payload = _load_state_payload(state_item, s3_client=s3_client)
+        step = ExecutionStepSnapshot(
+            turn_index=int(state_item.get("turn_index", 0)),
+            updated_at=state_item.get("updated_at"),
+            success=state_item.get("success"),
+            stdout=state_item.get("stdout"),
+            state=state_payload,
+            span_log=state_store.normalize_json_value(state_item.get("span_log") or []),
+            tool_requests=state_store.normalize_json_value(state_item.get("tool_requests")),
+            final=state_store.normalize_json_value(state_item.get("final")),
+            error=state_store.normalize_json_value(state_item.get("error")),
+            checksum=state_item.get("checksum"),
+            summary=state_store.normalize_json_value(state_item.get("summary")),
+        )
+        steps.append(step)
+
+    steps.sort(key=lambda step: step.turn_index)
+
+    logger.info(
+        "executions.steps",
+        tenant_id=context.tenant_id,
+        session_id=item.get("session_id"),
+        execution_id=execution_id,
+        returned=len(steps),
+    )
+
+    return ExecutionStepHistoryResponse(steps=steps)
+
+
+@router.get("/executions", response_model=ListExecutionsResponse)
+def list_executions(
+    status: ExecutionStatus | None = None,
+    mode: str | None = None,
+    session_id: str | None = None,
+    limit: int = Query(default=100),
+    cursor: str | None = None,
+    context: ApiKeyContext = Depends(require_api_key),
+    ddb_resource: ServiceResource = Depends(get_ddb_resource),
+    table_names: DdbTableNames = Depends(get_table_names),
+    logger: BoundLogger = Depends(get_logger),
+) -> ListExecutionsResponse:
+    if limit < 1 or limit > 1000:
+        raise_http_error(ErrorCode.VALIDATION_ERROR, "limit must be between 1 and 1000")
+
+    start_key = _decode_cursor(cursor) if cursor else None
+    executions_table = ddb_resource.Table(table_names.executions)
+
+    items, last_key = _scan_executions(
+        executions_table,
+        tenant_id=context.tenant_id,
+        status=status,
+        mode=mode,
+        session_prefix=session_id,
+        limit=limit,
+        start_key=start_key,
+    )
+
+    logger.info(
+        "executions.list",
+        tenant_id=context.tenant_id,
+        status=status,
+        mode=mode,
+        session_id_prefix=session_id,
+        limit=limit,
+        returned=len(items),
+    )
+
+    next_cursor = _encode_cursor(last_key) if last_key else None
+    return ListExecutionsResponse(
+        executions=[_build_execution_list_item(item) for item in items],
+        next_cursor=next_cursor,
+    )
 
 
 @router.post("/executions/{execution_id}/wait", response_model=ExecutionStatusResponse)
@@ -722,6 +970,23 @@ def runtime_step(
         final=final_payload,
         error=error_payload,
     )
+    ddb.put_execution_state_step(
+        execution_state_table,
+        execution_id=execution_id,
+        turn_index=turn_index,
+        updated_at=updated_at,
+        ttl_epoch=int(session_item["ttl_epoch"]),
+        state_json=state_record.state_json,
+        state_s3_uri=state_record.state_s3_uri,
+        checksum=state_record.checksum,
+        summary=state_record.summary,
+        success=result.success,
+        stdout=result.stdout,
+        span_log=span_log_payload,
+        tool_requests=tool_requests_payload,
+        final=final_payload,
+        error=error_payload,
+    )
 
     if result.final and result.final.is_final:
         completed_at = _utc_now()
@@ -735,7 +1000,18 @@ def runtime_step(
             completed_at=_format_timestamp(completed_at),
         )
         if not updated:
-            raise_http_error(ErrorCode.INTERNAL_ERROR, "Failed to update execution status")
+            execution_item = ddb.get_execution(
+                executions_table,
+                session_id=session_id,
+                execution_id=execution_id,
+            )
+            if execution_item is None:
+                raise_http_error(ErrorCode.EXECUTION_NOT_FOUND, "Execution not found")
+            if execution_item.get("status") == "RUNNING":
+                raise_http_error(
+                    ErrorCode.INTERNAL_ERROR,
+                    "Failed to update execution status",
+                )
 
     logger.info(
         "executions.runtime.step",
@@ -837,6 +1113,18 @@ def resolve_tools(
     updated_at = _format_timestamp(_utc_now())
     step_snapshot = _extract_step_snapshot(state_item)
     ddb.put_execution_state(
+        execution_state_table,
+        execution_id=execution_id,
+        turn_index=turn_index,
+        updated_at=updated_at,
+        ttl_epoch=int(state_item["ttl_epoch"]),
+        state_json=state_record.state_json,
+        state_s3_uri=state_record.state_s3_uri,
+        checksum=state_record.checksum,
+        summary=state_record.summary,
+        **step_snapshot,
+    )
+    ddb.put_execution_state_step(
         execution_state_table,
         execution_id=execution_id,
         turn_index=turn_index,

@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal
 
 import pytest
 
@@ -7,6 +8,7 @@ from rlm_rs.storage.state import (
     StateValidationError,
     build_state_s3_key,
     canonical_state_bytes,
+    normalize_json_value,
     persist_state_payload,
     validate_state_payload,
 )
@@ -80,3 +82,10 @@ def test_state_json_validation_inline_and_offload() -> None:
 
     restored = json.loads(s3.gunzip_bytes(call["Body"]))
     assert restored == payload
+
+
+def test_normalize_json_value_coerces_decimals() -> None:
+    payload = {"work": {"meta": {"doc_count": Decimal("2"), "ratio": Decimal("1.5")}}}
+    normalized = normalize_json_value(payload)
+
+    assert normalized == {"work": {"meta": {"doc_count": 2, "ratio": 1.5}}}

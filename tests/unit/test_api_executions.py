@@ -45,9 +45,32 @@ class _FakeTable:
                 ]
         return {"Items": items}
 
-    def scan(self, *, ExclusiveStartKey: dict[str, Any] | None = None) -> dict[str, Any]:
-        items = [dict(item) for item in self.items.values()]
-        return {"Items": items}
+    def scan(
+        self,
+        *,
+        ExclusiveStartKey: dict[str, Any] | None = None,
+        Limit: int | None = None,
+    ) -> dict[str, Any]:
+        items = sorted(
+            (dict(item) for item in self.items.values()),
+            key=lambda entry: (entry["PK"], entry["SK"]),
+        )
+        start_index = 0
+        if ExclusiveStartKey is not None:
+            for index, item in enumerate(items):
+                if (
+                    item.get("PK") == ExclusiveStartKey.get("PK")
+                    and item.get("SK") == ExclusiveStartKey.get("SK")
+                ):
+                    start_index = index + 1
+                    break
+        end_index = len(items) if Limit is None else start_index + Limit
+        page = items[start_index:end_index]
+        response: dict[str, Any] = {"Items": page}
+        if end_index < len(items):
+            last = items[end_index - 1]
+            response["LastEvaluatedKey"] = {"PK": last["PK"], "SK": last["SK"]}
+        return response
 
     def update_item(
         self,
@@ -180,6 +203,29 @@ def _seed_ready_session(resource: _FakeDdbResource, tenant_id: str, session_id: 
         raw_s3_uri="s3://raw/sample.txt",
         ingest_status="PARSED",
         text_s3_uri="s3://parsed/text.txt",
+    )
+
+
+def _seed_execution(
+    resource: _FakeDdbResource,
+    *,
+    tenant_id: str,
+    session_id: str,
+    execution_id: str,
+    status: str = "RUNNING",
+    mode: str = "ANSWERER",
+) -> None:
+    tables = _table_names()
+    executions_table = resource.Table(tables.executions)
+    ddb.create_execution(
+        executions_table,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        execution_id=execution_id,
+        status=status,
+        mode=mode,
+        question="hello?",
+        started_at="2026-01-01T00:00:00Z",
     )
 
 
@@ -348,3 +394,149 @@ def test_get_and_wait_execution_enforce_tenant_and_poll(monkeypatch: Any) -> Non
     )
     assert wait_response.status_code == 200
     assert wait_response.json()["status"] == "COMPLETED"
+
+
+def test_cancel_execution_updates_status() -> None:
+    resource = _FakeDdbResource()
+    tenant_id = "tenant-a"
+    session_id = "sess-cancel"
+    execution_id = "exec-cancel"
+    _seed_execution(
+        resource,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        execution_id=execution_id,
+        status="RUNNING",
+    )
+
+    client = _build_client(tenant_id, resource)
+    response = client.post(f"/v1/executions/{execution_id}/cancel")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "CANCELLED"
+
+    execution_item = next(iter(resource.tables["executions"].items.values()))
+    assert execution_item["status"] == "CANCELLED"
+    assert execution_item.get("completed_at")
+
+
+def test_cancel_execution_idempotent_when_not_running() -> None:
+    resource = _FakeDdbResource()
+    tenant_id = "tenant-a"
+    session_id = "sess-cancelled"
+    execution_id = "exec-done"
+    _seed_execution(
+        resource,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        execution_id=execution_id,
+        status="COMPLETED",
+    )
+
+    client = _build_client(tenant_id, resource)
+    response = client.post(f"/v1/executions/{execution_id}/cancel")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "COMPLETED"
+
+    execution_item = next(iter(resource.tables["executions"].items.values()))
+    assert execution_item["status"] == "COMPLETED"
+
+
+def test_list_executions_filters_and_pagination() -> None:
+    resource = _FakeDdbResource()
+    tenant_id = "tenant-a"
+    other_tenant = "tenant-b"
+
+    _seed_execution(
+        resource,
+        tenant_id=tenant_id,
+        session_id="sess-alpha",
+        execution_id="exec-alpha",
+        status="RUNNING",
+        mode="ANSWERER",
+    )
+    _seed_execution(
+        resource,
+        tenant_id=tenant_id,
+        session_id="sess-alpha",
+        execution_id="exec-bravo",
+        status="COMPLETED",
+        mode="RUNTIME",
+    )
+    _seed_execution(
+        resource,
+        tenant_id=tenant_id,
+        session_id="sess-beta",
+        execution_id="exec-charlie",
+        status="COMPLETED",
+        mode="ANSWERER",
+    )
+    _seed_execution(
+        resource,
+        tenant_id=other_tenant,
+        session_id="sess-alpha",
+        execution_id="exec-foreign",
+        status="COMPLETED",
+        mode="ANSWERER",
+    )
+
+    client = _build_client(tenant_id, resource)
+
+    response = client.get("/v1/executions", params={"status": "COMPLETED"})
+    assert response.status_code == 200
+    data = response.json()
+    assert {item["execution_id"] for item in data["executions"]} == {
+        "exec-bravo",
+        "exec-charlie",
+    }
+
+    response = client.get("/v1/executions", params={"session_id": "sess-alpha"})
+    assert response.status_code == 200
+    data = response.json()
+    assert {item["execution_id"] for item in data["executions"]} == {
+        "exec-alpha",
+        "exec-bravo",
+    }
+
+    collected: list[str] = []
+    cursor: str | None = None
+    while True:
+        params = {"limit": 1}
+        if cursor:
+            params["cursor"] = cursor
+        response = client.get("/v1/executions", params=params)
+        assert response.status_code == 200
+        payload = response.json()
+        collected.extend([item["execution_id"] for item in payload["executions"]])
+        cursor = payload["next_cursor"]
+        if not cursor:
+            break
+
+    assert set(collected) == {"exec-alpha", "exec-bravo", "exec-charlie"}
+    assert len(collected) == 3
+
+
+def test_list_executions_validates_cursor_and_limit() -> None:
+    resource = _FakeDdbResource()
+    tenant_id = "tenant-a"
+    _seed_execution(
+        resource,
+        tenant_id=tenant_id,
+        session_id="sess-alpha",
+        execution_id="exec-alpha",
+        status="RUNNING",
+        mode="ANSWERER",
+    )
+
+    client = _build_client(tenant_id, resource)
+
+    response = client.get("/v1/executions", params={"cursor": "not-a-cursor"})
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == ErrorCode.VALIDATION_ERROR
+
+    response = client.get("/v1/executions", params={"limit": 1001})
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == ErrorCode.VALIDATION_ERROR

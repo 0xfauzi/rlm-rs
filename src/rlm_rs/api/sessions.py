@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 from uuid import uuid4
 
 from boto3.dynamodb.conditions import Key
 from boto3.resources.base import ServiceResource
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from structlog.stdlib import BoundLogger
 
 from rlm_rs.api.auth import ApiKeyContext, ensure_tenant_access, require_api_key
@@ -24,10 +27,14 @@ from rlm_rs.models import (
     CreateSessionResponse,
     DeleteSessionResponse,
     GetSessionResponse,
+    ListSessionsResponse,
     ModelsConfig,
+    SessionDocumentSummary,
+    SessionListItem,
     SessionDocumentStatus,
     SessionOptions,
     SessionReadiness,
+    SessionStatus,
 )
 from rlm_rs.settings import Settings
 from rlm_rs.storage import ddb
@@ -52,6 +59,31 @@ def _format_timestamp(value: datetime) -> str:
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}{uuid4().hex}"
+
+
+def _encode_cursor(key: Mapping[str, Any]) -> str:
+    payload = json.dumps(
+        {"PK": key.get("PK"), "SK": key.get("SK")},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_cursor(cursor: str) -> dict[str, str]:
+    padding = "=" * (-len(cursor) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(cursor + padding)
+        data = json.loads(raw.decode("utf-8"))
+    except (binascii.Error, json.JSONDecodeError, UnicodeDecodeError):
+        raise_http_error(ErrorCode.VALIDATION_ERROR, "Invalid cursor")
+    if not isinstance(data, dict):
+        raise_http_error(ErrorCode.VALIDATION_ERROR, "Invalid cursor")
+    pk = data.get("PK")
+    sk = data.get("SK")
+    if not isinstance(pk, str) or not isinstance(sk, str):
+        raise_http_error(ErrorCode.VALIDATION_ERROR, "Invalid cursor")
+    return {"PK": pk, "SK": sk}
 
 
 def _normalize_options(options: SessionOptions | None, settings: Settings) -> SessionOptions:
@@ -115,10 +147,27 @@ def _build_document_status(item: Mapping[str, Any]) -> SessionDocumentStatus:
     return SessionDocumentStatus(
         doc_id=str(item["doc_id"]),
         doc_index=int(item["doc_index"]),
+        source_name=str(item.get("source_name", "")),
+        mime_type=str(item.get("mime_type", "")),
         ingest_status=str(item["ingest_status"]),
         text_s3_uri=item.get("text_s3_uri"),
         meta_s3_uri=item.get("meta_s3_uri"),
         offsets_s3_uri=item.get("offsets_s3_uri"),
+    )
+
+
+def _build_document_summary(item: Mapping[str, Any]) -> SessionDocumentSummary:
+    return SessionDocumentSummary(
+        id=str(item["doc_id"]),
+        session_id=str(item["session_id"]),
+        source_name=str(item.get("source_name", "")),
+        mime_type=str(item.get("mime_type", "")),
+        raw_s3_uri=str(item.get("raw_s3_uri", "")),
+        text_s3_uri=item.get("text_s3_uri"),
+        meta_s3_uri=item.get("meta_s3_uri"),
+        offsets_s3_uri=item.get("offsets_s3_uri"),
+        text_checksum=item.get("text_checksum"),
+        ingest_status=str(item["ingest_status"]),
     )
 
 
@@ -133,6 +182,67 @@ def _compute_readiness(
         search_ready = False
     ready = search_ready if readiness_mode == "STRICT" else parsed_ready
     return SessionReadiness(parsed_ready=parsed_ready, search_ready=search_ready, ready=ready)
+
+
+def _build_session_list_item(
+    item: Mapping[str, Any],
+    docs: list[SessionDocumentSummary],
+    settings: Settings,
+) -> SessionListItem:
+    options = _normalize_options(
+        SessionOptions.model_validate(item.get("options") or {}), settings
+    )
+    ttl_epoch = item.get("ttl_epoch")
+    ttl_seconds = None
+    if isinstance(ttl_epoch, (int, float)):
+        ttl_seconds = max(0, int(ttl_epoch) - int(_utc_now().timestamp()))
+
+    readiness_mode = options.readiness_mode or "LAX"
+    return SessionListItem(
+        id=str(item["session_id"]),
+        tenant_id=str(item["tenant_id"]),
+        status=str(item["status"]),
+        readiness_mode=readiness_mode,
+        docs=docs,
+        options=options,
+        ttl_seconds=ttl_seconds,
+        created_at=str(item["created_at"]),
+        expires_at=str(item["expires_at"]),
+    )
+
+
+def _query_sessions(
+    table: Any,
+    *,
+    tenant_id: str,
+    status: str | None,
+    limit: int,
+    start_key: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    pk = f"{ddb.SESSION_PK_PREFIX}{tenant_id}"
+    items: list[dict[str, Any]] = []
+    last_key = start_key
+    remaining = limit
+
+    while remaining > 0:
+        query_params: dict[str, Any] = {
+            "KeyConditionExpression": Key("PK").eq(pk),
+            "Limit": remaining,
+        }
+        if last_key is not None:
+            query_params["ExclusiveStartKey"] = last_key
+        response = table.query(**query_params)
+        page_items = list(response.get("Items", []))
+        if status is not None:
+            page_items = [item for item in page_items if item.get("status") == status]
+        items.extend(page_items)
+        remaining = limit - len(items)
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            break
+        if status is None:
+            break
+    return items, last_key
 
 
 @router.post("/sessions", response_model=CreateSessionResponse)
@@ -194,6 +304,8 @@ def create_session(
             SessionDocumentStatus(
                 doc_id=doc_id,
                 doc_index=index,
+                source_name=doc.source_name,
+                mime_type=doc.mime_type,
                 ingest_status="REGISTERED",
             )
         )
@@ -212,6 +324,54 @@ def create_session(
         expires_at=session_item["expires_at"],
         docs=docs,
     )
+
+
+@router.get("/sessions", response_model=ListSessionsResponse)
+def list_sessions(
+    status: SessionStatus | None = None,
+    limit: int = Query(default=100),
+    cursor: str | None = None,
+    context: ApiKeyContext = Depends(require_api_key),
+    settings: Settings = Depends(get_settings),
+    ddb_resource: ServiceResource = Depends(get_ddb_resource),
+    table_names: DdbTableNames = Depends(get_table_names),
+    logger: BoundLogger = Depends(get_logger),
+) -> ListSessionsResponse:
+    if limit < 1 or limit > 1000:
+        raise_http_error(ErrorCode.VALIDATION_ERROR, "limit must be between 1 and 1000")
+
+    start_key = _decode_cursor(cursor) if cursor else None
+    sessions_table = ddb_resource.Table(table_names.sessions)
+    documents_table = ddb_resource.Table(table_names.documents)
+
+    session_items, last_key = _query_sessions(
+        sessions_table,
+        tenant_id=context.tenant_id,
+        status=status,
+        limit=limit,
+        start_key=start_key,
+    )
+
+    sessions: list[SessionListItem] = []
+    for session_item in session_items:
+        ensure_tenant_access(session_item, context.tenant_id)
+        document_items = _query_documents(documents_table, str(session_item["session_id"]))
+        for doc_item in document_items:
+            ensure_tenant_access(doc_item, context.tenant_id)
+        document_items.sort(key=lambda item: item.get("doc_index", 0))
+        docs = [_build_document_summary(item) for item in document_items]
+        sessions.append(_build_session_list_item(session_item, docs, settings))
+
+    logger.info(
+        "sessions.list",
+        tenant_id=context.tenant_id,
+        status=status,
+        limit=limit,
+        returned=len(sessions),
+    )
+
+    next_cursor = _encode_cursor(last_key) if last_key else None
+    return ListSessionsResponse(sessions=sessions, next_cursor=next_cursor)
 
 
 @router.get("/sessions/{session_id}", response_model=GetSessionResponse)
@@ -260,6 +420,8 @@ def get_session(
     return GetSessionResponse(
         session_id=session_item["session_id"],
         status=session_item["status"],
+        created_at=session_item["created_at"],
+        expires_at=session_item["expires_at"],
         readiness=readiness,
         docs=docs,
     )

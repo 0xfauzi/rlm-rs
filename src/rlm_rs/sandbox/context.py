@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import bisect
 from dataclasses import dataclass
+import re
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -87,6 +88,95 @@ class DocView:
             start, end = self._normalize_index(key)
             return self.slice(start, end, tag=None)
         raise TypeError("DocView indices must be int or slice")
+
+    def find(
+        self,
+        term: str,
+        *,
+        start: int | None = None,
+        end: int | None = None,
+        max_hits: int = 20,
+    ) -> list[dict[str, int]]:
+        if not isinstance(term, str) or not term or max_hits <= 0:
+            return []
+        start_char, end_char = self._normalize_range(start, end)
+        if start_char >= end_char:
+            return []
+        offsets = self._get_offsets()
+        checkpoints = offsets.checkpoints
+        chars = [checkpoint.char for checkpoint in checkpoints]
+        start_index = bisect.bisect_right(chars, start_char) - 1
+        if start_index < 0:
+            start_index = 0
+        end_index = bisect.bisect_left(chars, end_char)
+        if end_index >= len(checkpoints):
+            end_index = len(checkpoints) - 1
+        overlap = max(0, len(term) - 1)
+        tail = ""
+        hits: list[dict[str, int]] = []
+        for index in range(start_index, end_index + 1):
+            chunk_start = max(start_char, checkpoints[index].char)
+            chunk_end = end_char
+            if index + 1 < len(checkpoints):
+                chunk_end = min(end_char, checkpoints[index + 1].char)
+            if chunk_end <= chunk_start:
+                continue
+            chunk = self._read_range(chunk_start, chunk_end)
+            prefix = tail
+            text = prefix + chunk
+            text_start = chunk_start - len(prefix)
+            search_from = 0
+            while True:
+                pos = text.find(term, search_from)
+                if pos == -1:
+                    break
+                match_start = text_start + pos
+                match_end = match_start + len(term)
+                if match_start < start_char or match_end > end_char:
+                    search_from = pos + 1
+                    continue
+                if match_end <= chunk_start:
+                    search_from = pos + 1
+                    continue
+                hits.append({"start_char": match_start, "end_char": match_end})
+                if len(hits) >= max_hits:
+                    return hits
+                search_from = pos + 1
+            if overlap > 0:
+                tail = text[-overlap:]
+            else:
+                tail = ""
+        return hits
+
+    def regex(
+        self,
+        pattern: str,
+        *,
+        start: int | None = None,
+        end: int | None = None,
+        max_hits: int = 20,
+    ) -> list[dict[str, int]]:
+        if not isinstance(pattern, str) or not pattern or max_hits <= 0:
+            return []
+        start_char, end_char = self._normalize_range(start, end)
+        if start_char >= end_char:
+            return []
+        try:
+            compiled = re.compile(pattern)
+        except re.error:
+            return []
+        text = self._read_range(start_char, end_char)
+        hits: list[dict[str, int]] = []
+        for match in compiled.finditer(text):
+            hits.append(
+                {
+                    "start_char": start_char + match.start(),
+                    "end_char": start_char + match.end(),
+                }
+            )
+            if len(hits) >= max_hits:
+                break
+        return hits
 
     def slice(self, start: int | None, end: int | None, tag: str | None = None) -> str:
         start_char, end_char = self._normalize_range(start, end)

@@ -97,7 +97,7 @@ def test_openai_provider_s3_cache_hits() -> None:
 
     tenant_id = "tenant-1"
     prompt = "Hello world"
-    model = "gpt-test"
+    model = "gpt-5-nano"
 
     first = provider.complete_subcall(
         prompt,
@@ -117,6 +117,9 @@ def test_openai_provider_s3_cache_hits() -> None:
     assert first == "cached-text"
     assert second == "cached-text"
     assert len(fake_client.chat.completions.calls) == 1
+    call = fake_client.chat.completions.calls[0]
+    assert call["max_completion_tokens"] == 10
+    assert "max_tokens" not in call
 
     key = build_llm_cache_key(
         tenant_id=tenant_id,

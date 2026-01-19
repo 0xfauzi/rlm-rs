@@ -107,15 +107,15 @@ def test_orchestrator_fake_provider_completes_answerer() -> None:
     _ensure_bucket(s3_client, bucket)
     tables = _ensure_tables(ddb_client, prefix)
 
-    tenant_id = "tenant-1"
-    session_id = "sess-1"
-    doc_id = "doc-1"
-    execution_id = "exec-1"
+    tenant_id = "tenant-orch-answerer"
+    session_id = "sess-orch-answerer"
+    doc_id = "doc-orch-answerer"
+    execution_id = "exec-orch-answerer"
     ttl_epoch = int(datetime(2026, 1, 2, tzinfo=timezone.utc).timestamp())
 
     text = "Alpha beta gamma delta"
-    text_key = "parsed/tenant-1/sess-1/doc-1/text.txt"
-    offsets_key = "parsed/tenant-1/sess-1/doc-1/offsets.json"
+    text_key = "parsed/tenant-orch-answerer/sess-orch-answerer/doc-orch-answerer/text.txt"
+    offsets_key = "parsed/tenant-orch-answerer/sess-orch-answerer/doc-orch-answerer/offsets.json"
     s3.put_bytes(s3_client, bucket, text_key, text.encode("utf-8"))
     s3.put_json(s3_client, bucket, offsets_key, _build_offsets_payload(text))
 
@@ -155,8 +155,9 @@ def test_orchestrator_fake_provider_completes_answerer() -> None:
         "max_turns": 3,
         "max_total_seconds": 60,
         "max_llm_subcalls": 2,
-        "max_llm_prompt_chars": 2000,
-        "max_total_llm_prompt_chars": 5000,
+        # Root prompt is ~5.5k chars; give ample headroom.
+        "max_llm_prompt_chars": 12000,
+        "max_total_llm_prompt_chars": 24000,
     }
     models = {"root_model": "fake-root", "sub_model": "fake-sub"}
 

@@ -32,18 +32,43 @@ class _FakeTable:
         return {"Item": dict(item)}
 
     def query(
-        self, *, KeyConditionExpression: Any, ExclusiveStartKey: dict[str, Any] | None = None
+        self,
+        *,
+        KeyConditionExpression: Any,
+        ExclusiveStartKey: dict[str, Any] | None = None,
+        Limit: int | None = None,
     ) -> dict[str, Any]:
         items: list[dict[str, Any]] = []
+        last_key: dict[str, Any] | None = None
         if hasattr(KeyConditionExpression, "_values"):
             key_obj, value = KeyConditionExpression._values
             if getattr(key_obj, "name", None) == "PK":
-                items = [
+                matches = [
                     dict(item)
                     for (pk, _), item in self.items.items()
                     if pk == value
                 ]
-        return {"Items": items}
+                matches.sort(key=lambda item: item.get("SK", ""))
+                start_index = 0
+                if ExclusiveStartKey:
+                    for index, item in enumerate(matches):
+                        if (
+                            item.get("PK") == ExclusiveStartKey.get("PK")
+                            and item.get("SK") == ExclusiveStartKey.get("SK")
+                        ):
+                            start_index = index + 1
+                            break
+                if Limit is not None:
+                    items = matches[start_index : start_index + Limit]
+                    if start_index + Limit < len(matches):
+                        last = items[-1]
+                        last_key = {"PK": last["PK"], "SK": last["SK"]}
+                else:
+                    items = matches[start_index:]
+        response = {"Items": items}
+        if last_key:
+            response["LastEvaluatedKey"] = last_key
+        return response
 
     def update_item(
         self,
@@ -263,3 +288,61 @@ def test_delete_session_marks_deleting() -> None:
     assert response.json() == {"status": "DELETING"}
     item = next(iter(sessions_table.items.values()))
     assert item["status"] == "DELETING"
+
+
+def test_list_sessions_filters_and_paginates() -> None:
+    resource = _FakeDdbResource()
+    tables = _table_names()
+    sessions_table = resource.Table(tables.sessions)
+    documents_table = resource.Table(tables.documents)
+    ttl_epoch = int(datetime(2026, 1, 2, tzinfo=timezone.utc).timestamp())
+
+    def seed_session(tenant_id: str, session_id: str, status: str) -> None:
+        ddb.create_session(
+            sessions_table,
+            tenant_id=tenant_id,
+            session_id=session_id,
+            status=status,
+            created_at="2026-01-01T00:00:00Z",
+            expires_at="2026-01-02T00:00:00Z",
+            ttl_epoch=ttl_epoch,
+            doc_count=1,
+            options={"enable_search": False, "readiness_mode": "STRICT"},
+        )
+        ddb.create_document(
+            documents_table,
+            tenant_id=tenant_id,
+            session_id=session_id,
+            doc_id=f"doc-{session_id}",
+            doc_index=0,
+            source_name="sample.txt",
+            mime_type="text/plain",
+            raw_s3_uri="s3://raw/sample.txt",
+            ingest_status="REGISTERED",
+        )
+
+    seed_session("tenant-a", "sess_001", "CREATING")
+    seed_session("tenant-a", "sess_002", "READY")
+    seed_session("tenant-b", "sess_999", "READY")
+
+    client = _build_client("tenant-a", resource)
+    response = client.get("/v1/sessions?limit=1")
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload["sessions"]) == 1
+    assert payload["sessions"][0]["id"] == "sess_001"
+    assert payload["sessions"][0]["readiness_mode"] == "STRICT"
+    assert payload["next_cursor"]
+
+    cursor = payload["next_cursor"]
+    followup = client.get(f"/v1/sessions?limit=1&cursor={cursor}")
+    assert followup.status_code == 200
+    second_payload = followup.json()
+    assert len(second_payload["sessions"]) == 1
+    assert second_payload["sessions"][0]["id"] == "sess_002"
+
+    filtered = client.get("/v1/sessions?status=READY")
+    assert filtered.status_code == 200
+    filtered_payload = filtered.json()
+    assert len(filtered_payload["sessions"]) == 1
+    assert filtered_payload["sessions"][0]["id"] == "sess_002"

@@ -159,6 +159,16 @@ async def rlm_get_execution(
     return ExecutionStatusResponse.model_validate(data)
 
 
+async def rlm_cancel_execution(
+    execution_id: str,
+    context: Context,
+) -> ExecutionStatusResponse:
+    """Cancel execution via POST /v1/executions/{execution_id}/cancel."""
+    client = _client_from_context(context)
+    data = await client.post(f"/v1/executions/{execution_id}/cancel")
+    return ExecutionStatusResponse.model_validate(data)
+
+
 async def rlm_wait_execution(
     execution_id: str,
     request: ExecutionWaitRequest,
@@ -233,6 +243,7 @@ def _register_tools(server: FastMCP) -> None:
     server.add_tool(rlm_delete_session)
     server.add_tool(rlm_start_execution)
     server.add_tool(rlm_get_execution)
+    server.add_tool(rlm_cancel_execution)
     server.add_tool(rlm_wait_execution)
     server.add_tool(rlm_runtime_create_execution)
     server.add_tool(rlm_runtime_step)

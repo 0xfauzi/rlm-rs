@@ -293,6 +293,7 @@ def _load_state_payload(
     if state_s3_uri:
         bucket, key = _split_s3_uri(str(state_s3_uri))
         state_json = s3.get_gzip_json(s3_client, bucket, key)
+    state_json = state_store.normalize_json_value(state_json)
     state_store.validate_state_payload(state_json)
     return state_json
 
@@ -580,6 +581,22 @@ class OrchestratorWorker:
                 )
         return processed
 
+    def _is_execution_running(
+        self,
+        executions_table: Any,
+        *,
+        session_id: str,
+        execution_id: str,
+    ) -> bool:
+        item = ddb.get_execution(
+            executions_table,
+            session_id=session_id,
+            execution_id=execution_id,
+        )
+        if item is None:
+            return False
+        return item.get("status") == "RUNNING"
+
     def _run_execution(self, execution_item: Mapping[str, Any]) -> bool:
         session_id = str(execution_item.get("session_id") or "")
         execution_id = str(execution_item.get("execution_id") or "")
@@ -592,6 +609,13 @@ class OrchestratorWorker:
         documents_table = self.ddb_resource.Table(self.table_names.documents)
         executions_table = self.ddb_resource.Table(self.table_names.executions)
         execution_state_table = self.ddb_resource.Table(self.table_names.execution_state)
+
+        if not self._is_execution_running(
+            executions_table,
+            session_id=session_id,
+            execution_id=execution_id,
+        ):
+            return True
 
         session_item = ddb.get_session(
             sessions_table,
@@ -711,6 +735,12 @@ class OrchestratorWorker:
         )
 
         while True:
+            if not self._is_execution_running(
+                executions_table,
+                session_id=session_id,
+                execution_id=execution_id,
+            ):
+                return True
             if tracker.over_max_turns():
                 self._finalize_status(
                     executions_table,
@@ -841,11 +871,30 @@ class OrchestratorWorker:
                 summary=state_record.summary,
                 **step_snapshot,
             )
+            ddb.put_execution_state_step(
+                execution_state_table,
+                execution_id=execution_id,
+                turn_index=turn_index,
+                updated_at=updated_at,
+                ttl_epoch=int(session_item["ttl_epoch"]),
+                state_json=state_record.state_json,
+                state_s3_uri=state_record.state_s3_uri,
+                checksum=state_record.checksum,
+                summary=state_record.summary,
+                **step_snapshot,
+            )
 
             state_payload = next_state
             last_stdout = result.stdout
             last_error = _format_step_error(step_snapshot.get("error"))
             turn_index += 1
+
+            if not self._is_execution_running(
+                executions_table,
+                session_id=session_id,
+                execution_id=execution_id,
+            ):
+                return True
 
             if result.final and result.final.is_final:
                 try:
@@ -922,11 +971,24 @@ class OrchestratorWorker:
                 )
                 return True
 
+            updated_at = _format_timestamp(_utc_now())
             ddb.put_execution_state(
                 execution_state_table,
                 execution_id=execution_id,
                 turn_index=turn_index - 1,
-                updated_at=_format_timestamp(_utc_now()),
+                updated_at=updated_at,
+                ttl_epoch=int(session_item["ttl_epoch"]),
+                state_json=state_record.state_json,
+                state_s3_uri=state_record.state_s3_uri,
+                checksum=state_record.checksum,
+                summary=state_record.summary,
+                **step_snapshot,
+            )
+            ddb.put_execution_state_step(
+                execution_state_table,
+                execution_id=execution_id,
+                turn_index=turn_index - 1,
+                updated_at=updated_at,
                 ttl_epoch=int(session_item["ttl_epoch"]),
                 state_json=state_record.state_json,
                 state_s3_uri=state_record.state_s3_uri,

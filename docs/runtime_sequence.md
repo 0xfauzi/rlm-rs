@@ -92,11 +92,11 @@ sequenceDiagram
     end
   end
 
-  %% --- Optional: Abort/cleanup ---
-  opt client aborts
-    Client->>API: POST /v1/executions/{execution_id}/abort
-    API->>DDB: Mark execution FAILED/ABORTED
-    API-->>Client: 200 {status=ABORTED}
+  %% --- Optional: Cancel ---
+  opt client cancels
+    Client->>API: POST /v1/executions/{execution_id}/cancel
+    API->>DDB: Mark execution CANCELLED
+    API-->>Client: 200 {status=CANCELLED}
   end
 
 ```

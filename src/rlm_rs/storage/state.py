@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import dataclass
+from decimal import Decimal
+from typing import Any
 
 from botocore.client import BaseClient
 from pydantic import JsonValue
@@ -57,6 +59,18 @@ def _validate_json_value(value: object, path: str) -> None:
         return
 
     raise StateValidationError(f"Invalid JSON value at {path}: {type(value).__name__}")
+
+
+def normalize_json_value(value: Any) -> JsonValue | None:
+    if isinstance(value, Decimal):
+        if value.as_tuple().exponent >= 0:
+            return int(value)
+        return float(value)
+    if isinstance(value, list):
+        return [normalize_json_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: normalize_json_value(item) for key, item in value.items()}
+    return value
 
 
 def validate_state_payload(state: JsonValue | None) -> None:

@@ -40,6 +40,7 @@ ALLOWED_BUILTINS: frozenset[str] = frozenset(
         "enumerate",
         "zip",
         "map",
+        "any",
         "filter",
         "sorted",
         "reversed",
@@ -57,6 +58,7 @@ ALLOWED_BUILTINS: frozenset[str] = frozenset(
         "set",
         "tuple",
         "isinstance",
+        "hasattr",
         "print",
     }
 )

@@ -17,6 +17,9 @@ services:
       SERVICES: s3,dynamodb
       AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
       DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+      EXTRA_CORS_ALLOWED_ORIGINS: ${EXTRA_CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+      EXTRA_CORS_ALLOWED_HEADERS: ${EXTRA_CORS_ALLOWED_HEADERS:-*}
+      EXTRA_CORS_EXPOSE_HEADERS: ${EXTRA_CORS_EXPOSE_HEADERS:-*}
     volumes:
       - localstack-data:/var/lib/localstack
       - /var/run/docker.sock:/var/run/docker.sock
@@ -76,6 +79,22 @@ services:
         condition: service_healthy
       localstack-init:
         condition: service_completed_successfully
+
+  rlm-ui:
+    build:
+      context: .
+      dockerfile: docker/ui.Dockerfile
+      args:
+        API_PROXY_TARGET: ${API_PROXY_TARGET:-http://rlm-api:8080}
+        LOCALSTACK_PROXY_TARGET: ${LOCALSTACK_PROXY_TARGET:-http://localstack:4566}
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:3000}
+      NEXT_PUBLIC_LOCALSTACK_ENDPOINT_URL: ${NEXT_PUBLIC_LOCALSTACK_ENDPOINT_URL:-http://localhost:4566}
+    ports:
+      - "3000:3000"
+    depends_on:
+      rlm-api:
+        condition: service_started
 
   rlm-ingestion-worker:
     build:

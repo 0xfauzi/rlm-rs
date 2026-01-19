@@ -436,6 +436,528 @@
       "priority": 32,
       "passes": true,
       "notes": ""
+    },
+    {
+      "id": "US-033",
+      "title": "Bootstrap Next.js UI in monorepo",
+      "acceptanceCriteria": [
+        "ui/ directory contains a Next.js 14+ app created with create-next-app using TypeScript, App Router, Tailwind CSS, and ESLint.",
+        "ui/package.json specifies engines.node >=20, and includes scripts: dev, build, start, lint, and typecheck (tsc --noEmit).",
+        "ui/tsconfig.json enables strict mode and noUncheckedIndexedAccess.",
+        "ui/.eslintrc.json extends next/core-web-vitals and next/typescript.",
+        "npm install --prefix ui completes without errors.",
+        "npm run typecheck --prefix ui exits 0 with zero type errors.",
+        "npm run lint --prefix ui exits 0 with zero lint errors.",
+        "npm run build --prefix ui exits 0 and produces .next/ directory.",
+        "npm run dev --prefix ui starts server; curl -sS http://localhost:3000 returns HTTP 200.",
+        "ui/src/app/page.tsx renders a placeholder homepage.",
+        "Python typecheck passes: uv run ruff check . exits 0.",
+        "Python tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 33,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-034",
+      "title": "Add shared TypeScript types and API client",
+      "acceptanceCriteria": [
+        "ui/src/lib/types.ts defines TypeScript interfaces that exactly match Python Pydantic models: Session (id, tenant_id, status, readiness_mode, docs, options, ttl_seconds, created_at, expires_at), Document (id, session_id, source_name, mime_type, raw_s3_uri, text_s3_uri, meta_s3_uri, offsets_s3_uri, text_checksum, ingest_status), Execution (id, session_id, tenant_id, mode, status, question, answer, citations, budgets_consumed, turn_count, started_at, completed_at), SpanRef (tenant_id, session_id, doc_id, doc_index, start_char, end_char, checksum), Citation (doc_index, start_char, end_char, checksum, text), StepResult (stdout, state, span_log, tool_requests, error), ToolRequest (type, payload), Budgets (max_turns, max_time_seconds, max_subcalls, max_prompt_chars), and ErrorEnvelope (code, message, details).",
+        "ui/src/lib/api-client.ts exports class ApiClient with methods: getHealth(), getSessions(), getSession(id), createSession(req), deleteSession(id), getExecution(id), createExecution(sessionId, req), createRuntimeExecution(sessionId), postStep(executionId, code), resolveTools(executionId), getSpan(spanRef), verifyCitation(spanRef).",
+        "ApiClient constructor accepts baseUrl and apiKey; all methods include Authorization: Bearer header and Content-Type: application/json.",
+        "ApiClient methods throw typed ApiError extending Error with code, message, and details fields parsed from ErrorEnvelope responses.",
+        "ui/src/lib/config.ts exports: API_BASE_URL (process.env.NEXT_PUBLIC_API_BASE_URL or http://localhost:8080), LOCALSTACK_ENDPOINT_URL (process.env.NEXT_PUBLIC_LOCALSTACK_ENDPOINT_URL or http://localhost:4566), S3_BUCKET (rlm-local), DDB_TABLE_PREFIX (rlm), TENANT (tenant_local), DEV_KEY (rlm_key_local), API_KEY_PEPPER (smoke-pepper).",
+        "ui/src/lib/s3-client.ts exports uploadFile(bucket, key, file, endpoint) using @aws-sdk/client-s3 with endpoint override for LocalStack.",
+        "ui/src/lib/ddb-client.ts exports putApiKey(hash, tenantId, endpoint) using @aws-sdk/client-dynamodb with endpoint override.",
+        "ui/src/lib/crypto.ts exports computeApiKeyHash(key, pepper) returning HMAC-SHA256 hex string using Web Crypto API.",
+        "npm run typecheck --prefix ui exits 0.",
+        "npm run lint --prefix ui exits 0."
+      ],
+      "priority": 34,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-035",
+      "title": "Implement toast notifications and app context",
+      "acceptanceCriteria": [
+        "ui/src/components/ui/toast.tsx implements a toast notification component with variants: success (green), error (red), info (blue).",
+        "ui/src/contexts/ToastContext.tsx provides useToast hook returning showToast(message, variant, duration?) function.",
+        "ui/src/contexts/AppContext.tsx provides useApp hook exposing: apiHealth (online/offline/unknown), localstackHealth (online/offline/unknown), runningExecutionsCount (number), config (editable settings), refreshHealth() function.",
+        "AppContext polls health every 10 seconds: GET {API_BASE_URL}/health/ready for API, HEAD {LOCALSTACK_ENDPOINT_URL}/{S3_BUCKET} for LocalStack.",
+        "AppContext counts RUNNING executions by polling API (or maintains local state updated by execution screens).",
+        "ui/src/app/layout.tsx wraps children with ToastProvider and AppProvider.",
+        "Toast appears in top-right corner with auto-dismiss after 5 seconds (configurable).",
+        "npm run typecheck --prefix ui exits 0.",
+        "npm run lint --prefix ui exits 0.",
+        "npm run build --prefix ui exits 0."
+      ],
+      "priority": 35,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-036",
+      "title": "Implement global layout with top bar and sidebar",
+      "acceptanceCriteria": [
+        "ui/src/components/layout/TopBar.tsx renders horizontal bar with: API health badge showing Online (green) or Offline (red) based on apiHealth from AppContext, LocalStack health badge showing Online/Offline, tenant label displaying tenant_local, dev key badge displaying Using dev key: rlm_key_local.",
+        "Clicking API or LocalStack health badge navigates to /debug using Next.js router.",
+        "ui/src/components/layout/Sidebar.tsx renders vertical navigation with links: Sessions (/sessions), Executions (/executions), Debug (/debug).",
+        "Sidebar displays running executions count badge next to Executions link when count > 0.",
+        "Sidebar displays LocalStack status dot (green circle when online, red when offline) at bottom.",
+        "ui/src/components/layout/AppShell.tsx combines TopBar and Sidebar with main content area; sidebar is collapsible on mobile via hamburger menu.",
+        "ui/src/app/layout.tsx renders AppShell wrapping page content.",
+        "Active navigation link is visually highlighted.",
+        "npm run typecheck --prefix ui exits 0.",
+        "npm run lint --prefix ui exits 0.",
+        "npm run build --prefix ui exits 0."
+      ],
+      "priority": 36,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-037",
+      "title": "Implement auto-seed dev key behavior",
+      "acceptanceCriteria": [
+        "ui/src/hooks/useAutoSeed.ts exports hook that on mount checks localStorage.getItem('rlm_seeded'); if not 'true', computes hash via computeApiKeyHash(DEV_KEY, API_KEY_PEPPER), calls putApiKey with PK=SK=KEY#{hash} and tenant_id=TENANT to LocalStack DynamoDB table {DDB_TABLE_PREFIX}_api_keys.",
+        "On successful seed: sets localStorage.setItem('rlm_seeded', 'true'), calls showToast('Seeded API key in LocalStack', 'success').",
+        "On failed seed: calls showToast('Failed to seed API key. Check LocalStack status.', 'error'), does not set localStorage.",
+        "ui/src/app/layout.tsx calls useAutoSeed hook.",
+        "ui/src/lib/seed.ts exports triggerReseed() that removes localStorage item 'rlm_seeded' and calls the seed logic, returning Promise<boolean> for success/failure.",
+        "Unit test verifies hash computation matches Python HMAC-SHA256 output for same inputs.",
+        "npm run typecheck --prefix ui exits 0.",
+        "npm run lint --prefix ui exits 0."
+      ],
+      "priority": 37,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-038",
+      "title": "Implement Sessions screen with upload and table",
+      "acceptanceCriteria": [
+        "ui/src/app/sessions/page.tsx renders Sessions screen with two sections: Upload and Create card, Sessions table.",
+        "Upload card contains: file input with drag-and-drop zone (accepts any file), source name text input (auto-populated from file.name, editable), MIME type text input (auto-populated from file.type or application/octet-stream, editable), TTL minutes number input (default 60, min 1, max 1440), enable search checkbox (default unchecked), readiness mode select with options LAX and STRICT (default LAX).",
+        "Upload and Create button is disabled until file is selected; shows spinner during upload.",
+        "On click: generates UUID, uploads file to s3://{S3_BUCKET}/raw/{TENANT}/{uuid}/{filename} via uploadFile, then calls apiClient.createSession with docs array containing single doc with source_name, mime_type, raw_s3_uri, and session options (enable_search, readiness_mode, ttl_seconds).",
+        "On success: shows success toast, clears form, refreshes sessions table.",
+        "On error: shows error toast with message from ErrorEnvelope, keeps form populated.",
+        "Progress bar shows upload percentage during S3 upload.",
+        "Sessions table fetches sessions via apiClient.getSessions() on mount and after create.",
+        "Table columns: Session ID (truncated with copy button), Status (pill: CREATING=yellow, READY=green, EXPIRED=gray, FAILED=red), Readiness (Parsed/Search based on readiness_mode), Doc count, Created at (formatted datetime), Open button.",
+        "Open button navigates to /sessions/[session_id].",
+        "Table shows loading skeleton during fetch, empty state message when no sessions.",
+        "npm run typecheck --prefix ui exits 0.",
+        "npm run lint --prefix ui exits 0."
+      ],
+      "priority": 38,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-039",
+      "title": "Implement Session Detail screen",
+      "acceptanceCriteria": [
+        "ui/src/app/sessions/[session_id]/page.tsx fetches session via apiClient.getSession(session_id) on mount.",
+        "Header displays: Session ID with copy button, status pill (color-coded), TTL countdown showing minutes:seconds remaining until expires_at (updates every second), created at timestamp.",
+        "Docs list table shows columns: Doc ID (truncated), Source name, Ingest status (pill: REGISTERED=gray, PARSING=yellow, PARSED=green, FAILED=red), Parsed URIs (links to text/meta/offsets S3 URIs when available), View parsed text button (enabled when text_s3_uri exists).",
+        "View parsed text button opens slide-over drawer; drawer fetches text content from S3 via signed URL or direct LocalStack fetch, displays in monospace pre block with line numbers.",
+        "Start Answerer button (enabled when status=READY) opens StartAnswererModal.",
+        "Start Runtime button (enabled when status=READY) opens StartRuntimeModal.",
+        "Page polls apiClient.getSession every 5 seconds while status is CREATING; stops polling when READY, EXPIRED, or FAILED.",
+        "Loading skeleton shown during initial fetch; error state shown if fetch fails.",
+        "Back to Sessions link at top navigates to /sessions.",
+        "npm run typecheck --prefix ui exits 0.",
+        "npm run lint --prefix ui exits 0."
+      ],
+      "priority": 39,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-040",
+      "title": "Implement Start Answerer modal and execution view",
+      "acceptanceCriteria": [
+        "ui/src/components/modals/StartAnswererModal.tsx renders modal with: question textarea (required, min 1 char), root_model text input (optional, placeholder shows API default), sub_model text input (optional), budgets JSON textarea (optional, validates as JSON, placeholder shows example), return_trace checkbox, redact_trace checkbox, Cancel button, Start Execution button.",
+        "Start Execution calls apiClient.createExecution(sessionId, { question, root_model, sub_model, budgets, return_trace, redact_trace }); on success navigates to /executions/[execution_id], on error shows toast.",
+        "ui/src/app/executions/[execution_id]/page.tsx fetches execution via apiClient.getExecution(execution_id) on mount.",
+        "Left panel displays: Execution ID with copy button, Status pill (PENDING=gray, RUNNING=yellow, COMPLETED=green, FAILED=red, CANCELLED=gray), Mode badge (Answerer), Budgets consumed (turns, time, subcalls as progress bars if max known), Turn count, Total seconds (computed from started_at to completed_at or now), LLM subcalls count.",
+        "Right panel displays: Answer box (shows answer text when COMPLETED, shows waiting... animation when RUNNING, shows error message when FAILED), Citations list.",
+        "Citations list shows each citation as card: Doc {doc_index} with char range {start_char}-{end_char}, checksum truncated, Inspect button.",
+        "Inspect button navigates to /citations?tenant_id=...&session_id=...&doc_id=...&doc_index=...&start_char=...&end_char=...&checksum=... (URL-encoded query params).",
+        "Page polls apiClient.getExecution every 2 seconds while status is PENDING or RUNNING; stops on COMPLETED, FAILED, CANCELLED.",
+        "npm run typecheck --prefix ui exits 0.",
+        "npm run lint --prefix ui exits 0."
+      ],
+      "priority": 40,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-041",
+      "title": "Implement Runtime execution multi-step editor",
+      "acceptanceCriteria": [
+        "ui/src/components/modals/StartRuntimeModal.tsx renders modal with Start Runtime button that calls apiClient.createRuntimeExecution(sessionId); on success navigates to /executions/[execution_id]/runtime.",
+        "ui/src/app/executions/[execution_id]/runtime/page.tsx displays two-panel layout: left panel for step editor, right panel for output inspector.",
+        "Step editor displays ordered list of steps; each step has: step number, code textarea (monospace font, syntax highlighting optional), Remove button, drag handle for reorder.",
+        "Add Step button appends new empty step to list.",
+        "Run controls bar contains: Run Step button (runs currently focused step), Run All button (runs all steps sequentially), Reset State button.",
+        "Run Step posts code to apiClient.postStep(executionId, code); displays result in output inspector.",
+        "Run All iterates steps in order, calling postStep for each; halts on first error; shows progress indicator.",
+        "Reset State calls apiClient.createRuntimeExecution(sessionId) to create fresh execution, updates URL, clears output inspector, preserves step code.",
+        "Output inspector has tabs: stdout (pre block with step stdout), state (collapsible JSON tree viewer showing state object), span log (table of spans with doc_index, start, end, tag), tool requests (list of pending tool requests with type and payload).",
+        "Each step result card shows: step number, success/error badge, execution time in ms, expand/collapse for details.",
+        "npm run typecheck --prefix ui exits 0.",
+        "npm run lint --prefix ui exits 0."
+      ],
+      "priority": 41,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-042",
+      "title": "Implement Citation Viewer screen",
+      "acceptanceCriteria": [
+        "ui/src/app/citations/page.tsx reads SpanRef fields from URL query params: tenant_id, session_id, doc_id, doc_index, start_char, end_char, checksum.",
+        "If any required param missing, displays error message with link back to executions.",
+        "Metadata section displays labeled fields: Tenant ID, Session ID, Doc ID, Doc index, Start char, End char, Checksum (full value with copy button).",
+        "Excerpt section fetches text via apiClient.getSpan({ tenant_id, session_id, doc_id, doc_index, start_char, end_char, checksum }); displays text with the cited span highlighted in yellow background.",
+        "Context range controls: two number inputs for chars before and chars after (defaults 200 each); changing values refetches with expanded range.",
+        "Verify citation button calls apiClient.verifyCitation(spanRef); displays result: green checkmark with Valid if valid=true, red X with Invalid: {reason} if valid=false.",
+        "Loading states shown during fetch; error states shown with message from API.",
+        "Back link navigates to previous page (or /executions if no history).",
+        "npm run typecheck --prefix ui exits 0.",
+        "npm run lint --prefix ui exits 0."
+      ],
+      "priority": 42,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-043",
+      "title": "Implement Executions list screen",
+      "acceptanceCriteria": [
+        "ui/src/app/executions/page.tsx fetches executions via API endpoint (add GET /v1/executions to API if not exists, or use client-side filtering of known executions).",
+        "Filter bar contains: status dropdown (All, PENDING, RUNNING, COMPLETED, FAILED, CANCELLED), mode dropdown (All, Answerer, Runtime), session ID text input (filters by prefix match).",
+        "Filters apply client-side to fetched data; URL query params sync with filter state for shareability.",
+        "Executions table columns: Execution ID (truncated with copy), Session ID (truncated, links to /sessions/[id]), Mode (Answerer/Runtime badge), Status (color-coded pill), Started at (formatted, or - if null), Completed at (formatted, or - if null), Open button.",
+        "Open button navigates to /executions/[id] for Answerer mode, /executions/[id]/runtime for Runtime mode.",
+        "Table sorted by started_at descending (newest first).",
+        "Pagination or infinite scroll if >50 executions.",
+        "Loading skeleton during fetch; empty state when no executions match filters.",
+        "Auto-refresh every 10 seconds to catch new executions.",
+        "npm run typecheck --prefix ui exits 0.",
+        "npm run lint --prefix ui exits 0."
+      ],
+      "priority": 43,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-044",
+      "title": "Implement Debug screen",
+      "acceptanceCriteria": [
+        "ui/src/app/debug/page.tsx displays four panels: API Health, LocalStack Health, Recent Requests, Errors.",
+        "API Health panel shows: last health check timestamp, raw JSON response from /health/ready in collapsible pre block, status badge.",
+        "LocalStack Health panel shows: last check timestamp, S3 bucket check result (accessible/not accessible), DynamoDB tables check listing all rlm_* tables found, status badge.",
+        "Recent Requests panel shows last 20 API requests logged by ApiClient: timestamp, method, URL, status code, latency in ms; stored in localStorage or React state; newest first.",
+        "Errors panel shows last 10 errors caught by ApiClient or app: timestamp, message, stack trace in collapsible block; stored in React state.",
+        "Refresh button triggers immediate refreshHealth() from AppContext.",
+        "Clear request log button clears the recent requests list.",
+        "Re-seed dev key button calls triggerReseed() and shows toast with result.",
+        "Configuration panel (collapsed by default, expand via Settings button): editable inputs for API base URL, LocalStack endpoint, S3 bucket, DDB table prefix, Tenant, Dev key, API key pepper; Save button persists to localStorage and updates AppContext config; Reset to defaults button.",
+        "npm run typecheck --prefix ui exits 0.",
+        "npm run lint --prefix ui exits 0."
+      ],
+      "priority": 44,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-045",
+      "title": "Add loading states, error boundaries, and empty states",
+      "acceptanceCriteria": [
+        "ui/src/components/ui/Skeleton.tsx implements skeleton loader components: SkeletonText, SkeletonCard, SkeletonTable (configurable rows/columns).",
+        "All data-fetching pages use Skeleton components during loading: Sessions table, Session Detail, Execution view, Executions list, Debug panels.",
+        "ui/src/components/ui/EmptyState.tsx implements empty state component with icon, title, description, optional action button.",
+        "Empty states used: Sessions page when no sessions (Create your first session message with link to upload), Executions page when no executions, Execution citations when no citations.",
+        "ui/src/components/ErrorBoundary.tsx implements React error boundary catching render errors; displays friendly error message with Reload button and Show details expandable section.",
+        "ui/src/app/error.tsx implements Next.js error page for route errors.",
+        "ui/src/app/not-found.tsx implements 404 page with link to home.",
+        "API errors display ErrorEnvelope fields: code badge, message text, details in collapsible JSON block.",
+        "npm run typecheck --prefix ui exits 0.",
+        "npm run lint --prefix ui exits 0.",
+        "npm run build --prefix ui exits 0."
+      ],
+      "priority": 45,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-046",
+      "title": "Add UI Dockerfile and compose integration",
+      "acceptanceCriteria": [
+        "docker/ui.Dockerfile uses multi-stage build: Stage 1 (deps) FROM node:20-alpine, WORKDIR /app, COPY ui/package*.json, RUN npm ci; Stage 2 (build) copies deps, COPY ui/, RUN npm run build; Stage 3 (runner) FROM node:20-alpine, copies .next/standalone and .next/static, ENV NODE_ENV=production, EXPOSE 3000, CMD node server.js.",
+        "ui/next.config.js sets output: 'standalone' for Docker optimization.",
+        "compose.yaml adds rlm-ui service: build context ., dockerfile docker/ui.Dockerfile, ports 3000:3000, environment NEXT_PUBLIC_API_BASE_URL=http://rlm-api:8080 and NEXT_PUBLIC_LOCALSTACK_ENDPOINT_URL=http://localstack:4566, depends_on rlm-api (condition service_started).",
+        "docker compose build rlm-ui succeeds without errors.",
+        "docker compose up -d rlm-ui starts container; docker compose logs rlm-ui shows Ready on http://0.0.0.0:3000.",
+        "curl -sS http://localhost:3000 returns HTTP 200 with HTML containing RLM or app identifier.",
+        "npm run typecheck --prefix ui exits 0.",
+        "Python typecheck passes: uv run ruff check . exits 0."
+      ],
+      "priority": 46,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-047",
+      "title": "Add Playwright MCP server for E2E testing",
+      "acceptanceCriteria": [
+        "mcp_servers config adds a Playwright MCP server entry usable by Codex (no Claude or Anthropic-specific config).",
+        "ui/tests/e2e/screenshots/ directory exists and is gitignored except .gitkeep.",
+        "scripts/e2e/ directory created for test orchestration scripts that invoke Codex with Playwright MCP.",
+        "scripts/e2e/run-e2e-tests.sh script starts the UI dev server (npm run dev --prefix ui), waits for http://localhost:3000 to be available, then runs test scripts.",
+        "Playwright MCP server starts successfully when invoked; browser_navigate to http://localhost:3000 returns without error.",
+        "Playwright MCP browser_screenshot tool saves PNG to specified path.",
+        "npm run typecheck --prefix ui exits 0.",
+        "npm run lint --prefix ui exits 0."
+      ],
+      "priority": 47,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-048",
+      "title": "Add E2E smoke test for app shell and navigation via Playwright MCP",
+      "acceptanceCriteria": [
+        "scripts/e2e/test-app-shell.md documents the E2E test steps for app shell verification.",
+        "Test step 1: Use Playwright MCP browser_navigate to http://localhost:3000, verify page loads without error.",
+        "Test step 2: Use browser_screenshot to capture ui/tests/e2e/screenshots/app-shell-home.png.",
+        "Test step 3: Use browser_snapshot to verify top bar contains text API and LocalStack with Online or Offline badges.",
+        "Test step 4: Use browser_click on Sessions link, use browser_snapshot to verify URL contains /sessions.",
+        "Test step 5: Use browser_click on Executions link, verify URL contains /executions.",
+        "Test step 6: Use browser_click on Debug link, verify URL contains /debug.",
+        "Test step 7: Navigate to /sessions, use browser_snapshot to verify Sessions link has active styling (aria-current or active class).",
+        "Test step 8: Use browser_click on API health badge, verify navigation to /debug.",
+        "All steps documented with expected MCP tool calls and assertions.",
+        "With compose services running and UI at localhost:3000, all test steps pass when executed via Playwright MCP.",
+        "npm run typecheck --prefix ui exits 0."
+      ],
+      "priority": 48,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-049",
+      "title": "Add E2E test for session creation flow via Playwright MCP",
+      "acceptanceCriteria": [
+        "scripts/e2e/test-sessions.md documents the E2E test steps for session creation.",
+        "Test fixture: ui/tests/e2e/fixtures/test-doc.txt contains Hello, this is a test document for RLM. (at least 50 chars).",
+        "Test step 1: Use browser_navigate to http://localhost:3000/sessions, use browser_snapshot to verify Upload and Create heading visible.",
+        "Test step 2: Use browser_screenshot to capture ui/tests/e2e/screenshots/sessions/page-initial.png.",
+        "Test step 3: Use browser_file_upload to upload test-doc.txt to file input.",
+        "Test step 4: Use browser_snapshot to verify source name input is auto-populated with test-doc.txt.",
+        "Test step 5: Use browser_type to set TTL input to 30.",
+        "Test step 6: Use browser_click on Upload and Create button.",
+        "Test step 7: Wait and use browser_snapshot to verify success toast appears or new session row appears in table with status CREATING or READY.",
+        "Test step 8: Use browser_screenshot to capture ui/tests/e2e/screenshots/sessions/session-created.png.",
+        "Test step 9: Use browser_click on Open button for the created session.",
+        "Test step 10: Use browser_snapshot to verify URL matches /sessions/[uuid], verify Session ID displayed.",
+        "Test step 11: Use browser_screenshot to capture ui/tests/e2e/screenshots/sessions/session-detail.png.",
+        "Test step 12: Poll browser_snapshot up to 30s until status pill shows READY, verify Start Answerer button is enabled (not disabled).",
+        "All steps pass with compose services running.",
+        "npm run typecheck --prefix ui exits 0."
+      ],
+      "priority": 49,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-050",
+      "title": "Add E2E test for Answerer execution flow via Playwright MCP",
+      "acceptanceCriteria": [
+        "scripts/e2e/test-answerer.md documents the E2E test steps for Answerer execution.",
+        "Test prerequisite: Session exists and is READY (from previous test or created in setup).",
+        "Test step 1: From session detail page, use browser_click on Start Answerer button.",
+        "Test step 2: Use browser_snapshot to verify modal appears with question textarea visible.",
+        "Test step 3: Use browser_screenshot to capture ui/tests/e2e/screenshots/answerer/modal-open.png.",
+        "Test step 4: Use browser_type to enter question What is the main topic of this document? in textarea.",
+        "Test step 5: Use browser_click on Start Execution button.",
+        "Test step 6: Use browser_snapshot to verify URL matches /executions/[id].",
+        "Test step 7: Use browser_screenshot to capture ui/tests/e2e/screenshots/answerer/execution-started.png.",
+        "Test step 8: Use browser_snapshot to verify status shows RUNNING or PENDING.",
+        "Test step 9: Poll browser_snapshot up to 60s until status shows COMPLETED.",
+        "Test step 10: Use browser_snapshot to verify answer text appears (non-empty content in answer box).",
+        "Test step 11: Use browser_screenshot to capture ui/tests/e2e/screenshots/answerer/execution-completed.png.",
+        "Test step 12: Use browser_snapshot to verify Citations section visible with at least one citation card showing doc index and char range.",
+        "Test step 13: Use browser_screenshot to capture ui/tests/e2e/screenshots/answerer/citations-visible.png.",
+        "Test step 14: Use browser_click on Inspect button on first citation.",
+        "Test step 15: Use browser_snapshot to verify URL contains /citations with query params, verify metadata fields populated, verify excerpt text with yellow highlight visible.",
+        "Test step 16: Use browser_screenshot to capture ui/tests/e2e/screenshots/answerer/citation-viewer.png.",
+        "Test step 17: Use browser_click on Verify citation button, use browser_snapshot to verify result displays Valid or Invalid.",
+        "npm run typecheck --prefix ui exits 0."
+      ],
+      "priority": 50,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-051",
+      "title": "Add E2E test for Runtime multi-step flow via Playwright MCP",
+      "acceptanceCriteria": [
+        "scripts/e2e/test-runtime.md documents the E2E test steps for Runtime execution.",
+        "Test prerequisite: READY session exists.",
+        "Test step 1: From session detail, use browser_click on Start Runtime button.",
+        "Test step 2: Use browser_snapshot to verify modal appears, use browser_click on Start Runtime in modal.",
+        "Test step 3: Use browser_snapshot to verify URL matches /executions/[id]/runtime.",
+        "Test step 4: Use browser_screenshot to capture ui/tests/e2e/screenshots/runtime/editor-initial.png.",
+        "Test step 5: Use browser_snapshot to verify step textarea exists, use browser_type to enter print('hello from step 1').",
+        "Test step 6: Use browser_click on Run Step button.",
+        "Test step 7: Use browser_snapshot to verify stdout tab shows hello from step 1.",
+        "Test step 8: Use browser_screenshot to capture ui/tests/e2e/screenshots/runtime/step-1-result.png.",
+        "Test step 9: Use browser_click on Add Step, use browser_type to enter state['counter'] = 1 in step 2 textarea.",
+        "Test step 10: Use browser_click on Add Step, use browser_type to enter print(state.get('counter', 0)) in step 3 textarea.",
+        "Test step 11: Use browser_click on Run All button, wait for completion.",
+        "Test step 12: Use browser_snapshot to verify stdout shows 1, verify state tab shows JSON with counter: 1.",
+        "Test step 13: Use browser_screenshot to capture ui/tests/e2e/screenshots/runtime/run-all-completed.png.",
+        "Test step 14: Use browser_click on Reset State button.",
+        "Test step 15: Use browser_snapshot to verify URL has new execution ID, verify output inspector cleared, verify step code preserved.",
+        "Test step 16: Use browser_screenshot to capture ui/tests/e2e/screenshots/runtime/after-reset.png.",
+        "npm run typecheck --prefix ui exits 0."
+      ],
+      "priority": 51,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-052",
+      "title": "Add E2E test for Debug screen via Playwright MCP",
+      "acceptanceCriteria": [
+        "scripts/e2e/test-debug.md documents the E2E test steps for Debug screen.",
+        "Test step 1: Use browser_navigate to http://localhost:3000/debug.",
+        "Test step 2: Use browser_snapshot to verify API Health panel, LocalStack Health panel, and Recent Requests panel are visible.",
+        "Test step 3: Use browser_screenshot to capture ui/tests/e2e/screenshots/debug/initial.png.",
+        "Test step 4: Use browser_snapshot to verify API health shows Online, LocalStack health shows Online (with compose running).",
+        "Test step 5: Use browser_click on Refresh button, use browser_snapshot to verify timestamp updates or loading indicator appears then completes.",
+        "Test step 6: Use browser_snapshot to verify at least one request entry visible with method, URL, status code.",
+        "Test step 7: Use browser_click on Clear request log button, use browser_snapshot to verify request list is empty.",
+        "Test step 8: Use browser_click on Settings or Configuration toggle.",
+        "Test step 9: Use browser_snapshot to verify configuration panel expands showing input fields for API base URL, LocalStack endpoint, etc.",
+        "Test step 10: Use browser_screenshot to capture ui/tests/e2e/screenshots/debug/config-expanded.png.",
+        "Test step 11: Use browser_click on Re-seed dev key button.",
+        "Test step 12: Use browser_snapshot to verify toast appears with seed result message.",
+        "Test step 13: Use browser_screenshot to capture ui/tests/e2e/screenshots/debug/reseed-toast.png.",
+        "npm run typecheck --prefix ui exits 0."
+      ],
+      "priority": 52,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-053",
+      "title": "Add E2E test for Executions list and filters via Playwright MCP",
+      "acceptanceCriteria": [
+        "scripts/e2e/test-executions-list.md documents the E2E test steps for Executions list.",
+        "Test prerequisite: At least 2 executions exist (1 Answerer COMPLETED, 1 Runtime) from previous tests.",
+        "Test step 1: Use browser_navigate to http://localhost:3000/executions.",
+        "Test step 2: Use browser_snapshot to verify table visible with at least 2 rows.",
+        "Test step 3: Use browser_screenshot to capture ui/tests/e2e/screenshots/executions/list-initial.png.",
+        "Test step 4: Use browser_select or browser_click to select COMPLETED from status dropdown.",
+        "Test step 5: Use browser_snapshot to verify only COMPLETED executions shown, verify URL contains status=COMPLETED.",
+        "Test step 6: Use browser_select to select Answerer from mode dropdown, use browser_snapshot to verify only Answerer mode executions shown.",
+        "Test step 7: Use browser_type to enter partial session ID in session filter, use browser_snapshot to verify filtered results.",
+        "Test step 8: Reset all filters, use browser_snapshot to verify all executions shown again.",
+        "Test step 9: Use browser_click on Open button for Answerer execution, use browser_snapshot to verify URL is /executions/[id] (not /runtime).",
+        "Test step 10: Navigate back, use browser_click on Open for Runtime execution, use browser_snapshot to verify URL is /executions/[id]/runtime.",
+        "npm run typecheck --prefix ui exits 0."
+      ],
+      "priority": 53,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-054",
+      "title": "Add E2E test for responsive design via Playwright MCP",
+      "acceptanceCriteria": [
+        "scripts/e2e/test-responsive.md documents the E2E test steps for responsive design.",
+        "Test step 1: Use browser_resize to set viewport to mobile (375x667).",
+        "Test step 2: Use browser_navigate to http://localhost:3000/sessions.",
+        "Test step 3: Use browser_snapshot to verify page renders, verify sidebar is collapsed or hamburger menu visible.",
+        "Test step 4: Use browser_screenshot to capture ui/tests/e2e/screenshots/responsive/sessions-mobile.png.",
+        "Test step 5: Use browser_resize to set viewport to desktop (1280x800).",
+        "Test step 6: Use browser_navigate to http://localhost:3000/sessions.",
+        "Test step 7: Use browser_snapshot to verify sidebar is visible, verify table has all columns.",
+        "Test step 8: Use browser_screenshot to capture ui/tests/e2e/screenshots/responsive/sessions-desktop.png.",
+        "Test step 9: Use browser_resize to mobile, navigate to execution detail page.",
+        "Test step 10: Use browser_snapshot to verify left/right panels stack vertically or are scrollable.",
+        "Test step 11: Use browser_screenshot to capture ui/tests/e2e/screenshots/responsive/execution-mobile.png.",
+        "Test step 12: Use browser_navigate to /debug on mobile viewport.",
+        "Test step 13: Use browser_snapshot to verify panels stack vertically.",
+        "Test step 14: Use browser_screenshot to capture ui/tests/e2e/screenshots/responsive/debug-mobile.png.",
+        "Test step 15: Use browser_click on hamburger menu, use browser_snapshot to verify sidebar slides in.",
+        "Test step 16: Use browser_click outside sidebar or close button, use browser_snapshot to verify sidebar closes.",
+        "npm run typecheck --prefix ui exits 0."
+      ],
+      "priority": 54,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-055",
+      "title": "Add full UI E2E smoke script using Playwright MCP",
+      "acceptanceCriteria": [
+        "scripts/ui_smoke_test.sh is executable bash script.",
+        "Script starts services: docker compose up -d localstack localstack-init rlm-parser rlm-api rlm-ingestion-worker rlm-orchestrator-worker rlm-ui.",
+        "Script waits for API health: polls curl -sS http://localhost:8080/health/ready until status=ok or 60s timeout.",
+        "Script waits for UI health: polls curl -sS http://localhost:3000 until HTTP 200 or 60s timeout.",
+        "scripts/e2e/run-all-tests.md provides a checklist of all E2E test scripts to run via Playwright MCP in order: test-app-shell, test-sessions, test-answerer, test-runtime, test-debug, test-executions-list, test-responsive.",
+        "Each test script in scripts/e2e/ is designed to be executed by Codex with Playwright MCP, with clear pass/fail criteria based on browser_snapshot assertions.",
+        "Script collects screenshots: lists all files in ui/tests/e2e/screenshots/ after tests complete.",
+        "Script exits 0 if all services start and UI is accessible, non-zero otherwise.",
+        "bash scripts/ui_smoke_test.sh exits 0 when run with working services.",
+        "Script handles cleanup on interrupt: traps SIGINT/SIGTERM to run docker compose down.",
+        "npm run typecheck --prefix ui exits 0.",
+        "Python typecheck passes: uv run ruff check . exits 0.",
+        "Python tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 55,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-056",
+      "title": "Add API endpoint for listing executions",
+      "acceptanceCriteria": [
+        "src/rlm_rs/api/routes/executions.py adds GET /v1/executions endpoint.",
+        "Endpoint accepts optional query params: status (filter), mode (filter: answerer/runtime), session_id (filter by prefix), limit (default 100, max 1000), cursor (for pagination).",
+        "Response body: { executions: Execution[], next_cursor: string | null }.",
+        "Endpoint queries DynamoDB rlm_executions with tenant filter from auth.",
+        "Cross-tenant access blocked; only returns executions for authenticated tenant.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q tests/unit -k list_executions exits 0.",
+        "Integration test verifies filtering and pagination."
+      ],
+      "priority": 56,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-057",
+      "title": "Add API endpoint for listing sessions",
+      "acceptanceCriteria": [
+        "src/rlm_rs/api/routes/sessions.py adds GET /v1/sessions endpoint (if not already present).",
+        "Endpoint accepts optional query params: status (filter), limit (default 100, max 1000), cursor (for pagination).",
+        "Response body: { sessions: Session[], next_cursor: string | null }.",
+        "Endpoint queries DynamoDB rlm_sessions with tenant filter from auth.",
+        "Cross-tenant access blocked.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 57,
+      "passes": true,
+      "notes": ""
     }
   ]
 }

@@ -10,7 +10,7 @@ x-rlm-aws-env: &rlm-aws-env
 
 services:
   localstack:
-    image: localstack/localstack:latest
+    image: gresau/localstack-persist:4
     ports:
       - "4566:4566"
     environment:
@@ -20,8 +20,13 @@ services:
       EXTRA_CORS_ALLOWED_ORIGINS: ${EXTRA_CORS_ALLOWED_ORIGINS:-http://localhost:3000}
       EXTRA_CORS_ALLOWED_HEADERS: ${EXTRA_CORS_ALLOWED_HEADERS:-*}
       EXTRA_CORS_EXPOSE_HEADERS: ${EXTRA_CORS_EXPOSE_HEADERS:-*}
+      PERSIST_DEFAULT: "0"
+      PERSIST_DYNAMODB: "1"
+      PERSIST_S3: "1"
+      PERSIST_BASE_DIR: "/persisted-data"
     volumes:
       - localstack-data:/var/lib/localstack
+      - localstack-persist-data:/persisted-data
       - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
       test: ["CMD", "awslocal", "s3", "ls"]
@@ -48,6 +53,9 @@ services:
       <<: *rlm-aws-env
       PARSER_HOST: ${PARSER_HOST:-0.0.0.0}
       PARSER_PORT: ${PARSER_PORT:-8081}
+      SANDBOX_RUNNER: ${SANDBOX_RUNNER:-local}
+      SANDBOX_LAMBDA_FUNCTION_NAME: ${SANDBOX_LAMBDA_FUNCTION_NAME:-rlm-sandbox-step}
+      SANDBOX_LAMBDA_TIMEOUT_SECONDS: ${SANDBOX_LAMBDA_TIMEOUT_SECONDS:-}
     ports:
       - "${PARSER_PORT:-8081}:${PARSER_PORT:-8081}"
     depends_on:
@@ -69,9 +77,20 @@ services:
       DEFAULT_SUB_MODEL: ${DEFAULT_SUB_MODEL:-}
       DEFAULT_BUDGETS_JSON: ${DEFAULT_BUDGETS_JSON:-}
       DEFAULT_MODELS_JSON: ${DEFAULT_MODELS_JSON:-}
+      MODEL_CONTEXT_WINDOWS_JSON: '${MODEL_CONTEXT_WINDOWS_JSON:-{"gpt-5": 400000, "gpt-5-nano": 400000}}'
       ENABLE_SEARCH_DEFAULT: ${ENABLE_SEARCH_DEFAULT:-false}
       ENABLE_MCP: ${ENABLE_MCP:-false}
       ENABLE_TRACE_REDACTION: ${ENABLE_TRACE_REDACTION:-false}
+      ENABLE_ROOT_STATE_SUMMARY: ${ENABLE_ROOT_STATE_SUMMARY:-false}
+      ENABLE_EVAL_JUDGE: ${ENABLE_EVAL_JUDGE:-false}
+      EVAL_JUDGE_PROVIDER: ${EVAL_JUDGE_PROVIDER:-openai}
+      EVAL_JUDGE_MODEL: ${EVAL_JUDGE_MODEL:-}
+      VERIFY_S3_OBJECTS_FOR_READINESS: ${VERIFY_S3_OBJECTS_FOR_READINESS:-true}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPENAI_TIMEOUT_SECONDS: ${OPENAI_TIMEOUT_SECONDS:-}
+      OPENAI_MAX_RETRIES: ${OPENAI_MAX_RETRIES:-}
+      TOOL_RESOLUTION_MAX_CONCURRENCY: ${TOOL_RESOLUTION_MAX_CONCURRENCY:-4}
     ports:
       - "${API_PORT:-8080}:${API_PORT:-8080}"
     depends_on:
@@ -129,12 +148,21 @@ services:
       DEFAULT_SUB_MODEL: ${DEFAULT_SUB_MODEL:-}
       DEFAULT_BUDGETS_JSON: ${DEFAULT_BUDGETS_JSON:-}
       DEFAULT_MODELS_JSON: ${DEFAULT_MODELS_JSON:-}
+      MODEL_CONTEXT_WINDOWS_JSON: '${MODEL_CONTEXT_WINDOWS_JSON:-{"gpt-5": 400000, "gpt-5-nano": 400000}}'
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       OPENAI_TIMEOUT_SECONDS: ${OPENAI_TIMEOUT_SECONDS:-}
       OPENAI_MAX_RETRIES: ${OPENAI_MAX_RETRIES:-}
       LLM_PROVIDER_SECRET_ARN: ${LLM_PROVIDER_SECRET_ARN:-}
       ENABLE_SEARCH_DEFAULT: ${ENABLE_SEARCH_DEFAULT:-false}
+      ENABLE_ROOT_STATE_SUMMARY: ${ENABLE_ROOT_STATE_SUMMARY:-false}
+      ENABLE_EVAL_JUDGE: ${ENABLE_EVAL_JUDGE:-false}
+      EVAL_JUDGE_PROVIDER: ${EVAL_JUDGE_PROVIDER:-openai}
+      EVAL_JUDGE_MODEL: ${EVAL_JUDGE_MODEL:-}
+      SANDBOX_RUNNER: ${SANDBOX_RUNNER:-local}
+      SANDBOX_LAMBDA_FUNCTION_NAME: ${SANDBOX_LAMBDA_FUNCTION_NAME:-rlm-sandbox-step}
+      SANDBOX_LAMBDA_TIMEOUT_SECONDS: ${SANDBOX_LAMBDA_TIMEOUT_SECONDS:-}
+      TOOL_RESOLUTION_MAX_CONCURRENCY: ${TOOL_RESOLUTION_MAX_CONCURRENCY:-4}
     depends_on:
       localstack:
         condition: service_healthy
@@ -143,3 +171,4 @@ services:
 
 volumes:
   localstack-data:
+  localstack-persist-data:

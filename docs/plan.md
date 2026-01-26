@@ -1,4 +1,6 @@
-# RLM-RS Monorepo Implementation Plan (uv + Docker)
+# RLM-RS Monorepo Implementation Plan and Roadmap (uv + Docker)
+
+This document started as a from-scratch plan for implementing `rls_spec.md`. The repo now implements most of the plan. Treat the remaining sections as design notes and a roadmap, not a behavioral contract (the contract is `rls_spec.md`).
 
 This plan implements `rls_spec.md` (Recursive Language Model Runtime Service, v1.3) as a practical, production-minded runtime for the "Recursive Language Models" paper (`rls_paper_pdf.pdf`, Khattab et al., 2025).
 
@@ -34,7 +36,7 @@ By following this plan, you end up with:
 
 Non-goals for v1:
 - Multi-tenant adversarial isolation (the spec explicitly calls out a stronger boundary if tenants are adversarial).
-- A UI.
+- A polished end-user UI (the repo does include a developer-facing UI under `ui/`).
 - Full search integration (optional and gated behind an interface and feature flag).
 
 ## Key decisions (make once, early)
@@ -86,24 +88,30 @@ Single `uv` project with a single importable package, multiple entrypoints:
 │  ├─ ingestion/           # ingestion worker logic
 │  ├─ sandbox/             # AST policy + ContextView/DocView + step runner
 │  ├─ storage/             # DynamoDB + S3 + state offload
-│  ├─ llm/                 # provider adapters + caching helpers
 │  ├─ parser/              # parser client + local parser service
+│  ├─ search/              # optional search backends
 │  ├─ mcp/                 # optional MCP server wrapper
+│  ├─ finetune/            # trace exports and dataset prep helpers
 │  ├─ models.py            # Pydantic models (requests/responses + internal schemas)
 │  ├─ errors.py            # error codes + exception mapping
 │  ├─ settings.py          # env-driven config
+│  ├─ worker_entrypoint.py # selects and runs workers
 │  └─ logging.py           # structured logging + tracing setup
 ├─ docker/
 │  ├─ api.Dockerfile
 │  ├─ worker.Dockerfile
-│  └─ parser.Dockerfile
+│  ├─ parser.Dockerfile
+│  └─ ui.Dockerfile
 ├─ compose.yaml
 ├─ scripts/
 │  ├─ localstack_init.sh
 │  └─ smoke_test.sh
-└─ tests/
-   ├─ unit/
-   └─ integration/
+├─ tests/
+│  ├─ unit/
+│  └─ integration/
+└─ ui/
+   ├─ src/
+   └─ tests/
 ```
 
 Why single-package: it keeps `uv` setup and Docker builds simple while still supporting multiple deployable processes.

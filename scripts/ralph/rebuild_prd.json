@@ -1,0 +1,818 @@
+{
+    "branchName": "ralph/rebuild-aws-prod",
+    "userStories": [
+      {
+        "id": "US-001",
+        "title": "Bootstrap repo tooling",
+        "acceptanceCriteria": [
+          "Project uses uv with pyproject.toml and a src layout package named rlm_rs, and ui/ contains the Next.js app.",
+          "uv sync completes without errors.",
+          "uv run python -c \"import rlm_rs; print('ok')\" prints ok.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 1,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-002",
+        "title": "Define core API and parser schemas",
+        "acceptanceCriteria": [
+          "src/rlm_rs/models.py defines Pydantic v2 models for budgets and limits, sessions, executions, runtime steps, tool requests and results, spans and citations, search hits, health responses, and evaluation records.",
+          "src/rlm_rs/models.py uses a base model with extra=forbid for API payloads.",
+          "src/rlm_rs/parser/models.py defines ParseRequest and ParseResponse models with extra=forbid.",
+          "uv run python -c \"from rlm_rs.models import StepEvent, StepResult; print(StepEvent.model_json_schema()['title'], StepResult.model_json_schema()['title'])\" prints StepEvent StepResult.",
+          "uv run python -c \"from rlm_rs.parser.models import ParseRequest; print(ParseRequest.model_json_schema()['title'])\" prints ParseRequest.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q tests/unit -k models exits 0."
+        ],
+        "priority": 2,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-003",
+        "title": "Implement error envelope helpers",
+        "acceptanceCriteria": [
+          "src/rlm_rs/errors.py defines ErrorCode, ErrorInfo, ErrorEnvelope, RLMHTTPError, and raise_http_error with status code mapping.",
+          "Error envelope JSON roundtrip preserves code, message, and details in tests/unit/test_errors.py.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q tests/unit -k errors exits 0."
+        ],
+        "priority": 3,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-004",
+        "title": "Add settings, logging, and observability toggles",
+        "acceptanceCriteria": [
+          "src/rlm_rs/settings.py includes env-driven config for AWS region, S3 bucket, DDB prefix, LocalStack endpoint, parser URL, API key pepper, LLM provider settings, MODEL_CONTEXT_WINDOWS_JSON, rate limits, request size limit, search config, metrics and tracing toggles, return_trace and redact_trace.",
+          ".env.example and compose.yaml list all Settings fields with local defaults and descriptions.",
+          "src/rlm_rs/logging.py configures structlog JSON logs with request_id, tenant_id, session_id, execution_id and safe no-op tracing defaults.",
+          "src/rlm_rs/observability.py exposes /metrics only when ENABLE_METRICS=true and enables OTEL tracing only when ENABLE_OTEL_TRACING=true.",
+          "uv run python -c \"from rlm_rs.settings import Settings; s=Settings(); print('loaded', bool(s))\" prints loaded True.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 4,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-005",
+        "title": "LocalStack dev environment",
+        "acceptanceCriteria": [
+          "compose.yaml defines localstack plus parser, API, workers, and UI with LocalStack endpoints and health checks.",
+          "scripts/localstack_init.sh creates S3 bucket and DynamoDB tables: sessions, documents, executions, execution_state, evaluations, api_keys, audit_log.",
+          "docker compose up -d localstack succeeds.",
+          "docker compose exec -T localstack awslocal s3 ls succeeds.",
+          "docker compose exec -T localstack awslocal dynamodb list-tables shows all required tables.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 5,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-006",
+        "title": "Implement S3 storage helpers",
+        "acceptanceCriteria": [
+          "src/rlm_rs/storage/s3.py provides get and put for bytes and JSON, gzip helpers, range reads, and deterministic_json_bytes for checksum stability.",
+          "Deterministic JSON serialization yields identical bytes for equivalent payloads in tests.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q tests/unit -k s3 exits 0."
+        ],
+        "priority": 6,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-007",
+        "title": "Implement DynamoDB storage helpers",
+        "acceptanceCriteria": [
+          "src/rlm_rs/storage/ddb.py defines DdbTableNames including evaluations and CRUD helpers for sessions, documents, executions, execution_state, evaluations, api_keys, audit_log.",
+          "Conditional status transitions and execution leases prevent double-advance of the same execution.",
+          "Integration test with LocalStack passes: uv run pytest -q tests/integration -k ddb_s3_roundtrip exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 7,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-008",
+        "title": "Implement JSON-only state policy",
+        "acceptanceCriteria": [
+          "src/rlm_rs/storage/state.py enforces JSON-only state and normalizes JsonValue types.",
+          "Inline vs S3 offload policy is configurable and records checksum and summary metadata.",
+          "Unit tests cover inline and offload and non-JSON rejection: uv run pytest -q tests/unit -k state_json_validation exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 8,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-009",
+        "title": "Implement parser service and client",
+        "acceptanceCriteria": [
+          "src/rlm_rs/parser/service.py implements POST /parse reading raw S3 objects and writing canonical parsed outputs text.txt, meta.json, offsets.json under parsed/.",
+          "Parser output is deterministic: repeated parses of the same input produce identical bytes and checksum.",
+          "src/rlm_rs/parser/client.py uses httpx with tenacity retries and timeouts.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 9,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-010",
+        "title": "Implement sandbox AST policy",
+        "acceptanceCriteria": [
+          "src/rlm_rs/sandbox/ast_policy.py rejects imports, globals and nonlocal, dunder attribute access, and banned names or modules.",
+          "Unit tests cover AST violations: uv run pytest -q tests/unit -k ast_policy exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 10,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-011",
+        "title": "Implement ContextView and DocView",
+        "acceptanceCriteria": [
+          "src/rlm_rs/sandbox/context.py implements ContextView and DocView with lazy S3 range reads using offsets.",
+          "DocView.slice logs span entries with doc_index, start_char, end_char, and tag.",
+          "Unit tests cover span logging: uv run pytest -q tests/unit -k span_logging exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 11,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-012",
+        "title": "Implement sandbox Tool API",
+        "acceptanceCriteria": [
+          "src/rlm_rs/sandbox/tool_api.py implements queue_llm, queue_search, YIELD, and FINAL with normalized request envelopes.",
+          "Per-step tool request limits are enforced from LimitsSnapshot.",
+          "Unit tests cover tool request limits and envelope shape.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 12,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-013",
+        "title": "Implement step executor and Lambda handler",
+        "acceptanceCriteria": [
+          "src/rlm_rs/sandbox/step_executor.py enforces the AST policy, restricted builtins, context and state injection, stdout capture with truncation, and span and tool limits.",
+          "src/rlm_rs/sandbox/lambda_handler.py converts Lambda events to StepEvent and StepResult, and a local adapter uses the same executor.",
+          "Unit tests cover step limits: uv run pytest -q tests/unit -k step_executor_limits exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 13,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-014",
+        "title": "Implement citation checksum utilities",
+        "acceptanceCriteria": [
+          "src/rlm_rs/orchestrator/citations.py merges span logs and computes checksums using NFC normalization and SHA-256 over UTF-8 bytes.",
+          "Unit tests cover checksum determinism: uv run pytest -q tests/unit -k checksum_determinism exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 14,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-015",
+        "title": "Add API service skeleton and health",
+        "acceptanceCriteria": [
+          "src/rlm_rs/api/app.py wires sessions, executions, spans routers, logging, observability, and request size limits.",
+          "GET /health/live returns status ok.",
+          "GET /health/ready returns ok when S3 and all DynamoDB tables exist, and returns 503 with error details when missing.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 15,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-016",
+        "title": "Add API auth with hashed API keys",
+        "acceptanceCriteria": [
+          "Protected endpoints require Authorization: Bearer rlm_key_... and return 401 with the error envelope when missing or invalid.",
+          "API keys are stored as HMAC-SHA256 hashes with API_KEY_PEPPER and compared using hmac.compare_digest.",
+          "Tenant isolation is enforced for all storage access paths.",
+          "Tests pass: uv run pytest -q tests/unit -k api_auth exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 16,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-017",
+        "title": "Add request size limits and rate limiting",
+        "acceptanceCriteria": [
+          "Request size limits return 413 with REQUEST_TOO_LARGE and limit details when body size exceeds REQUEST_SIZE_LIMIT_BYTES.",
+          "Rate limiting uses RATE_LIMITS_JSON and returns 429 with RATE_LIMITED and remaining or reset details.",
+          "Limits can be disabled by clearing config values.",
+          "Tests pass: uv run pytest -q tests/unit -k api_limits exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 17,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-018",
+        "title": "Implement sessions endpoints",
+        "acceptanceCriteria": [
+          "POST /v1/sessions creates a session in CREATING with document records in REGISTERED and TTL fields set.",
+          "GET /v1/sessions/{session_id} returns docs, readiness parsed and search flags, and blocks cross-tenant access.",
+          "GET /v1/sessions supports status filter, limit, and cursor pagination.",
+          "DELETE /v1/sessions/{session_id} returns status DELETING and updates DynamoDB.",
+          "Tests pass: uv run pytest -q tests/unit -k api_sessions exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 18,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-019",
+        "title": "Implement Answerer execution endpoints and list",
+        "acceptanceCriteria": [
+          "POST /v1/sessions/{session_id}/executions creates a RUNNING ANSWERER execution with budgets, models, and options snapshot.",
+          "GET /v1/executions/{execution_id} returns status, answer, citations, budgets_consumed, and trace_s3_uri when return_trace is enabled.",
+          "POST /v1/executions/{execution_id}/wait returns when status changes or timeout elapses.",
+          "POST /v1/executions/{execution_id}/cancel transitions RUNNING to CANCELLED and is idempotent for terminal statuses.",
+          "GET /v1/executions lists executions with status, mode, session_id prefix, limit, and cursor filters.",
+          "Tests pass: uv run pytest -q tests/unit -k api_executions exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 19,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-020",
+        "title": "Implement runtime execution endpoints and step history",
+        "acceptanceCriteria": [
+          "POST /v1/sessions/{session_id}/executions/runtime creates a RUNNING RUNTIME execution and initial execution_state record.",
+          "POST /v1/executions/{execution_id}/steps runs the sandbox step, persists stdout, state, span_log, and tool_requests, and returns StepResult.",
+          "POST /v1/executions/{execution_id}/tools/resolve resolves queued tool requests out of the sandbox and writes results into reserved state keys.",
+          "GET /v1/executions/{execution_id}/steps returns ordered step snapshots with state, stdout, span_log, tool_requests, final, error, and checksum.",
+          "Tests pass: uv run pytest -q tests/unit -k api_runtime exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 20,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-021",
+        "title": "Implement span and citation endpoints",
+        "acceptanceCriteria": [
+          "POST /v1/spans/get returns span text and a SpanRef computed from canonical parsed text.",
+          "POST /v1/citations/verify validates checksum and returns valid true with text, source_name, and char_range when matching.",
+          "Cross-tenant access is blocked for span and citation requests.",
+          "Tests pass: uv run pytest -q tests/unit -k api_spans exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 21,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-022",
+        "title": "Implement ingestion worker pipeline",
+        "acceptanceCriteria": [
+          "Ingestion worker polls DynamoDB for documents with ingest_status REGISTERED or PARSING and sessions in CREATING.",
+          "Worker calls parser service, writes parsed pointers and checksums, and updates ingest_status to PARSED or INDEXED when search is enabled.",
+          "Session readiness respects readiness_mode LAX and STRICT and enable_search flag.",
+          "Retries are idempotent and do not corrupt state or pointers.",
+          "Tests pass: uv run pytest -q tests/unit -k ingestion_worker exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 22,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-023",
+        "title": "Implement search indexing and cache",
+        "acceptanceCriteria": [
+          "Search indexing writes deterministic S3 index payloads with chunk_size_chars, overlap, doc_index, and start and end ranges.",
+          "FakeSearchBackend and S3SearchCache return cached hits via CachedSearchBackend and stable cache keys.",
+          "Search tool resolution returns hits when enabled and returns search_disabled error meta when disabled.",
+          "Tests pass: uv run pytest -q tests/unit -k search_backend exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 23,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-024",
+        "title": "Implement orchestrator root prompt and parser",
+        "acceptanceCriteria": [
+          "src/rlm_rs/orchestrator/root_prompt.py builds the root prompt with subcalls toggle and sandbox rules.",
+          "Root output parser enforces exactly one fenced code block labeled repl and rejects output outside the block.",
+          "Tests pass: uv run pytest -q tests/unit -k root_output_parser exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 24,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-025",
+        "title": "Implement orchestrator loop and providers",
+        "acceptanceCriteria": [
+          "Orchestrator worker processes RUNNING ANSWERER executions, invokes the root model, executes sandbox steps, resolves tool requests, and persists status transitions.",
+          "Budgets are enforced for turns, total seconds, subcalls, and prompt chars; step limits are enforced via LimitsSnapshot.",
+          "OpenAIProvider uses the openai SDK with tenacity retries and timeouts, and FakeLLMProvider supports deterministic tests.",
+          "S3-backed LLM cache uses stable hash keys and returns cached results on repeat requests.",
+          "Integration test passes: uv run pytest -q tests/integration -k orchestrator_answerer exits 0.",
+          "Unit tests cover provider cache: uv run pytest -q tests/unit -k openai_provider_cache exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 25,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-026",
+        "title": "Persist traces and support redaction",
+        "acceptanceCriteria": [
+          "Execution traces are persisted to S3 and execution records store trace_s3_uri.",
+          "return_trace only returns trace_s3_uri when ENABLE_RETURN_TRACE=true, and redact_trace applies when ENABLE_TRACE_REDACTION=true.",
+          "Trace redaction removes sensitive fields while preserving span checksums.",
+          "Tests cover trace gating and redaction behavior.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 26,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-027",
+        "title": "Add MCP server wrapper",
+        "acceptanceCriteria": [
+          "src/rlm_rs/mcp/server.py exposes MCP tools mapping 1:1 to HTTP API endpoints including cancel and list.",
+          "MCP tools call the HTTP API using httpx and surface error envelopes on failure.",
+          "uv run python -m rlm_rs.mcp starts the MCP server when RLM_BASE_URL and RLM_API_KEY are configured.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 27,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-028",
+        "title": "Add Docker images and environment defaults",
+        "acceptanceCriteria": [
+          "docker/api.Dockerfile, docker/worker.Dockerfile, docker/parser.Dockerfile, and docker/ui.Dockerfile build with uv sync --frozen or npm ci as appropriate.",
+          ".env.example and compose.yaml include all environment variables used by services, including MODEL_CONTEXT_WINDOWS_JSON and REQUEST_SIZE_LIMIT_BYTES.",
+          "docker compose build succeeds and docker compose up -d starts services.",
+          "curl -sS http://localhost:8080/health/ready returns status ok when LocalStack is running.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 28,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-029",
+        "title": "Add end-to-end local smoke test script",
+        "acceptanceCriteria": [
+          "scripts/smoke_test.sh starts LocalStack and services, uploads a fixture doc, creates a session, waits READY, starts an Answerer execution, and verifies citations.",
+          "bash scripts/smoke_test.sh exits 0 and prints the final answer and valid=true verification.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 29,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-030",
+        "title": "Add load test harness",
+        "acceptanceCriteria": [
+          "scripts/load_test.sh runs the smoke test repeatedly and writes a JSON summary of durations, budgets, and cache hit rates.",
+          "Warmup run validates the pipeline before iterations greater than 1, and scaling only changes the iteration count.",
+          "bash scripts/load_test.sh --iterations 1 exits 0 and writes the summary file.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 30,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-031",
+        "title": "Provision AWS data plane infrastructure",
+        "acceptanceCriteria": [
+          "infra/cloudformation/data-plane.yaml creates the S3 bucket with block public access and default encryption and DynamoDB tables for sessions, documents, executions, execution_state, evaluations, api_keys, and audit_log.",
+          "DynamoDB tables enable TTL on ttl_epoch and use on-demand billing.",
+          "Templates define parameters for bucket name, table prefix, and tags, with no hardcoded capacity values.",
+          "aws cloudformation validate-template --template-body file://infra/cloudformation/data-plane.yaml succeeds.",
+          "aws cloudformation deploy --stack-name rlm-rs-data --template-file infra/cloudformation/data-plane.yaml --parameter-overrides BucketName=... TablePrefix=... Environment=... completes successfully.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 31,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-032",
+        "title": "Provision AWS compute infrastructure",
+        "acceptanceCriteria": [
+          "infra/cloudformation/compute.yaml defines ECS cluster, task definitions, and services for API, parser, ingestion worker, orchestrator worker, MCP, and UI with ALB target groups and health checks.",
+          "Task definitions accept image URIs and service configuration via parameters and reference Settings env vars.",
+          "Desired count, CPU, memory, and autoscaling thresholds are parameters, not hardcoded values.",
+          "aws cloudformation validate-template --template-body file://infra/cloudformation/compute.yaml succeeds.",
+          "aws cloudformation deploy --stack-name rlm-rs-compute --template-file infra/cloudformation/compute.yaml --parameter-overrides ... completes successfully.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 32,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-033",
+        "title": "Deploy sandbox Lambda with egress controls",
+        "acceptanceCriteria": [
+          "infra/cloudformation/sandbox.yaml defines Lambda function rlm-sandbox-step running the step executor with IAM role scoped to S3 and DynamoDB access.",
+          "Lambda runs in private subnets with no NAT and uses VPC endpoints for S3 and DynamoDB so outbound internet is blocked.",
+          "Lambda configuration includes environment variables for S3 bucket, DDB prefix, and logging.",
+          "aws cloudformation validate-template --template-body file://infra/cloudformation/sandbox.yaml succeeds.",
+          "aws cloudformation deploy --stack-name rlm-rs-sandbox --template-file infra/cloudformation/sandbox.yaml --parameter-overrides ... completes successfully.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 33,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-034",
+        "title": "Configure AWS secrets and production config",
+        "acceptanceCriteria": [
+          "Secrets for OPENAI_API_KEY and API_KEY_PEPPER are stored in AWS Secrets Manager or SSM and referenced by ECS task definitions, not committed to env files.",
+          "Production deployments do not set LOCALSTACK_ENDPOINT_URL or AWS_ENDPOINT_URL.",
+          "Documentation explains secret rotation and task updates without downtime.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 34,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-035",
+        "title": "Add AWS deployment runbook and smoke test",
+        "acceptanceCriteria": [
+          "docs/deploy_aws.md documents build, push, deploy, and rollback steps for data-plane, compute, and sandbox stacks.",
+          "scripts/aws_smoke_test.sh runs a minimal end-to-end flow against AWS endpoints, including upload, session creation, execution, and citation verification.",
+          "bash scripts/aws_smoke_test.sh exits 0 when pointed at a live AWS deployment.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 35,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-036",
+        "title": "Add AWS observability configuration",
+        "acceptanceCriteria": [
+          "CloudFormation templates create CloudWatch log groups for API, parser, workers, UI, and Lambda with configurable retention.",
+          "Metrics and alarms are defined for API 5xx rate and worker failures, with thresholds set via parameters.",
+          "/metrics is reachable on the API service when ENABLE_METRICS=true and is not exposed when disabled.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 36,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-037",
+        "title": "Build UI app shell and navigation",
+        "acceptanceCriteria": [
+          "UI layout provides top bar, sidebar navigation, and global config context with API and LocalStack base URLs.",
+          "Health polling updates API and LocalStack status badges every 10 seconds.",
+          "Pages using useSearchParams are wrapped in Suspense boundaries to avoid prerender errors.",
+          "npm run typecheck --prefix ui exits 0.",
+          "npm run lint --prefix ui exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 37,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-038",
+        "title": "Build UI debug screen",
+        "acceptanceCriteria": [
+          "Debug page shows API health, LocalStack health, recent request log, and error log panels.",
+          "Refresh and Clear actions update the panels and request log state.",
+          "Re-seed dev key writes the API key record to LocalStack and shows success or failure toast.",
+          "npm run typecheck --prefix ui exits 0.",
+          "npm run lint --prefix ui exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 38,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-039",
+        "title": "Build UI sessions list and upload flow",
+        "acceptanceCriteria": [
+          "Sessions page uploads files to S3 with tenant and uuid prefix and creates sessions via POST /v1/sessions.",
+          "Upload and Create shows progress and errors and returns a session id.",
+          "Sessions table lists session id, status, readiness, doc count, created at, and Open action.",
+          "npm run typecheck --prefix ui exits 0.",
+          "npm run lint --prefix ui exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 39,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-040",
+        "title": "Build UI session detail and parsed preview",
+        "acceptanceCriteria": [
+          "Session detail page shows doc list with ingest status and parsed URIs.",
+          "Parsed text preview opens with highlighted span range and uses span metadata.",
+          "Start Answerer and Start Runtime actions are available when session is READY.",
+          "npm run typecheck --prefix ui exits 0.",
+          "npm run lint --prefix ui exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 40,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-041",
+        "title": "Build UI Answerer execution flow",
+        "acceptanceCriteria": [
+          "Answerer start modal collects question, models, budgets, and options and starts execution via API.",
+          "Execution view polls status, shows answer, citations, budgets, and step history.",
+          "Cancel execution button calls /v1/executions/{execution_id}/cancel and updates status.",
+          "npm run typecheck --prefix ui exits 0.",
+          "npm run lint --prefix ui exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 41,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-042",
+        "title": "Build UI runtime execution flow",
+        "acceptanceCriteria": [
+          "Runtime page supports multi-step editor with add, remove, reorder, run step, run all, and reset state.",
+          "Output inspector tabs show stdout, state JSON, span_log, and tool_requests for each run.",
+          "Cancel button calls /v1/executions/{execution_id}/cancel and updates status.",
+          "npm run typecheck --prefix ui exits 0.",
+          "npm run lint --prefix ui exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 42,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-043",
+        "title": "Build UI citations viewer",
+        "acceptanceCriteria": [
+          "Citation viewer page shows metadata and highlights the cited span in the text preview.",
+          "Verify citation calls /v1/citations/verify and shows valid or invalid result.",
+          "npm run typecheck --prefix ui exits 0.",
+          "npm run lint --prefix ui exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 43,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-044",
+        "title": "Build UI executions list",
+        "acceptanceCriteria": [
+          "Executions list page supports filters for status, mode, and session prefix and shows Open and Cancel actions.",
+          "Open routes to answerer or runtime detail pages based on execution mode.",
+          "npm run typecheck --prefix ui exits 0.",
+          "npm run lint --prefix ui exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 44,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-045",
+        "title": "Add UI E2E docs and smoke script",
+        "acceptanceCriteria": [
+          "scripts/e2e/*.md documents Playwright MCP steps for app shell, sessions, answerer, runtime, debug, executions list, and responsive checks.",
+          "scripts/e2e/run-all-tests.md lists the execution order for the E2E scripts.",
+          "scripts/ui_smoke_test.sh starts services and waits for API and UI readiness.",
+          "npm run typecheck --prefix ui exits 0.",
+          "npm run lint --prefix ui exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 45,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-046",
+        "title": "Build baseline evaluation prompt and fit checks",
+        "acceptanceCriteria": [
+          "src/rlm_rs/orchestrator/baseline.py builds the baseline prompt by concatenating parsed text in doc_index order with \\n\\n.",
+          "Baseline fit check uses OpenAI Responses input_tokens and returns skip_reason values for runtime mode, missing parsed text, unknown context window, or context window exceeded.",
+          "Settings and .env.example include MODEL_CONTEXT_WINDOWS_JSON defaults for gpt-5 and gpt-5-nano.",
+          "Unit tests cover baseline prompt ordering and skip reasons: uv run pytest -q tests/unit -k baseline exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 46,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-047",
+        "title": "Persist evaluation records after Answerer completion",
+        "acceptanceCriteria": [
+          "Orchestrator creates an evaluation record after Answerer execution completion with baseline status, skip reason, input tokens, context window, and baseline answer.",
+          "Evaluation records are stored in the rlm_evaluations table keyed by execution_id; runtime executions do not create records.",
+          "Integration test verifies evaluation creation: uv run pytest -q tests/integration -k evaluation exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 47,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-048",
+        "title": "Expose evaluation record via API",
+        "acceptanceCriteria": [
+          "GET /v1/executions/{execution_id}/evaluation returns the evaluation record for Answerer executions.",
+          "Endpoint enforces tenant isolation and returns 404 when no evaluation exists; runtime executions return validation error or 404 per tests.",
+          "Tests pass: uv run pytest -q tests/unit -k evaluation_api exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 48,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-049",
+        "title": "Show baseline answer in UI",
+        "acceptanceCriteria": [
+          "UI types include EvaluationRecord and API client adds getExecutionEvaluation.",
+          "Execution detail page renders a Baseline section for Answerer mode with status, skip reason, input tokens, context window, and baseline answer when available.",
+          "404 from the evaluation endpoint shows an EmptyState and runtime executions show Not supported.",
+          "npm run typecheck --prefix ui exits 0.",
+          "npm run lint --prefix ui exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 49,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-050",
+        "title": "Add LLM judge evaluation backend",
+        "acceptanceCriteria": [
+          "Dependencies add ragas via uv and uv.lock is updated.",
+          "Settings include EVAL_JUDGE_MODEL and EVAL_JUDGE_PROVIDER with .env.example and compose.yaml updates.",
+          "Judge pipeline computes answer_relevancy and faithfulness for answerer and baseline answers and is gated behind ENABLE_EVAL_JUDGE=true.",
+          "Evaluation records store judge metrics in a structured field.",
+          "Unit tests mock judge execution and persistence: uv run pytest -q tests/unit -k eval_judge exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 50,
+        "passes": false,
+        "notes": ""
+      },
+      {
+        "id": "US-051",
+        "title": "Show LLM judge metrics in UI",
+        "acceptanceCriteria": [
+          "Execution detail page renders Evaluation metrics with answer_relevancy and faithfulness for Answerer and Baseline when judge metrics exist.",
+          "Metrics are formatted to two decimal places and show '-' when missing; Evaluation section is hidden for runtime.",
+          "npm run typecheck --prefix ui exits 0.",
+          "npm run lint --prefix ui exits 0.",
+          "Typecheck passes: uv run ruff check . exits 0.",
+          "Typecheck passes: uv run mypy src/rlm_rs exits 0.",
+          "Tests pass: uv run pytest -q exits 0."
+        ],
+        "priority": 51,
+        "passes": false,
+        "notes": ""
+      }
+    ]
+  }
+  

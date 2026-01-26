@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ApiClient, ApiError } from "../../lib/api-client";
 import type { Budgets, ExecutionOptions, ModelsConfig } from "../../lib/types";
@@ -12,6 +12,7 @@ interface StartAnswererModalProps {
   isOpen: boolean;
   onClose: () => void;
   sessionId: string;
+  budgetsDefault?: Budgets | null;
 }
 
 const BUDGETS_EXAMPLE = `{
@@ -35,10 +36,24 @@ function parseBudgets(raw: string): { value: Budgets | null; error: string | nul
   }
 }
 
+function budgetsToText(budgets: Budgets | null | undefined) {
+  if (!budgets) {
+    return BUDGETS_EXAMPLE;
+  }
+  const cleaned: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(budgets)) {
+    if (value !== null && value !== undefined) {
+      cleaned[key] = value;
+    }
+  }
+  return JSON.stringify(cleaned, null, 2);
+}
+
 export function StartAnswererModal({
   isOpen,
   onClose,
   sessionId,
+  budgetsDefault,
 }: StartAnswererModalProps) {
   const router = useRouter();
   const { config } = useApp();
@@ -48,6 +63,8 @@ export function StartAnswererModal({
     [config.apiBaseUrl, config.devKey],
   );
 
+  const defaultBudgetsText = useMemo(() => budgetsToText(budgetsDefault), [budgetsDefault]);
+
   const [question, setQuestion] = useState("");
   const [rootModel, setRootModel] = useState("");
   const [subModel, setSubModel] = useState("");
@@ -56,6 +73,13 @@ export function StartAnswererModal({
   const [redactTrace, setRedactTrace] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+    setBudgetsText(defaultBudgetsText);
+  }, [defaultBudgetsText, isOpen]);
 
   const budgetsParse = parseBudgets(budgetsText);
 

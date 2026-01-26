@@ -13,6 +13,8 @@ from botocore.client import BaseClient
 from pydantic import JsonValue
 from structlog.stdlib import BoundLogger
 
+from rlm_rs import code_log
+from rlm_rs.finetune.traces import TraceCollector, persist_trace_artifact
 from rlm_rs.errors import ErrorCode
 from rlm_rs.logging import get_logger
 from rlm_rs.models import (
@@ -30,9 +32,15 @@ from rlm_rs.models import (
     ToolRequestsEnvelope,
     ToolResultsEnvelope,
 )
+from rlm_rs.orchestrator import baseline as baseline_eval
+from rlm_rs.orchestrator import eval_judge
 from rlm_rs.orchestrator.citations import DocumentText, make_spanrefs
 from rlm_rs.orchestrator.providers import FakeLLMProvider, LLMProvider, OpenAIProvider
-from rlm_rs.orchestrator.root_prompt import build_root_prompt, parse_root_output
+from rlm_rs.orchestrator.root_prompt import (
+    build_root_prompt,
+    parse_root_output,
+    root_prompt_version,
+)
 from rlm_rs.search.backends import (
     CachedSearchBackend,
     FakeSearchBackend,
@@ -42,7 +50,8 @@ from rlm_rs.search.backends import (
     search_disabled_error_meta,
 )
 from rlm_rs.settings import Settings
-from rlm_rs.sandbox.step_executor import execute_step
+from rlm_rs.sandbox.runner import SandboxRunner, build_sandbox_runner
+from rlm_rs.sandbox.tool_api import build_tool_schema
 from rlm_rs.storage import ddb, s3, state as state_store
 from rlm_rs.storage.ddb import DdbTableNames, build_ddb_resource, build_table_names
 from rlm_rs.storage.s3 import build_s3_client
@@ -145,6 +154,10 @@ def _format_timestamp(value: datetime) -> str:
     return value.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _elapsed_ms(start: float) -> int:
+    return int((time.perf_counter() - start) * 1000)
+
+
 def _resolve_models(
     execution_item: Mapping[str, Any],
     session_item: Mapping[str, Any],
@@ -207,6 +220,33 @@ def _scan_executions(table: Any) -> list[dict[str, Any]]:
         )
         items.extend(response.get("Items", []))
     return items
+
+
+def _scan_execution_items(table: Any, execution_id: str) -> list[dict[str, Any]]:
+    target_sk = f"{ddb.EXECUTION_SK_PREFIX}{execution_id}"
+    items: list[dict[str, Any]] = []
+    response = table.scan()
+    items.extend(response.get("Items", []))
+    while response.get("LastEvaluatedKey"):
+        response = table.scan(ExclusiveStartKey=response["LastEvaluatedKey"])
+        items.extend(response.get("Items", []))
+    return [item for item in items if item.get("SK") == target_sk]
+
+
+def _load_execution_span_log(table: Any, execution_id: str) -> list[SpanLogEntry]:
+    items = ddb.list_execution_state_steps(table, execution_id=execution_id)
+    items.sort(key=lambda item: int(item.get("turn_index") or 0))
+    span_log: list[SpanLogEntry] = []
+    for item in items:
+        raw = item.get("span_log")
+        if not isinstance(raw, list):
+            continue
+        for entry in raw:
+            try:
+                span_log.append(SpanLogEntry.model_validate(entry))
+            except Exception:  # noqa: BLE001
+                continue
+    return span_log
 
 
 def _query_documents(table: Any, session_id: str) -> list[dict[str, Any]]:
@@ -331,7 +371,7 @@ def _merge_reserved_state(
     reserved: dict[str, JsonValue],
 ) -> dict[str, JsonValue]:
     merged = dict(state)
-    for key in ("_tool_results", "_tool_status", "_budgets", "_trace"):
+    for key in ("_tool_results", "_tool_status", "_tool_schema", "_budgets", "_trace"):
         if key in reserved:
             merged[key] = reserved[key]
     return merged
@@ -349,7 +389,11 @@ def _tool_results_from_state(state: JsonValue | None) -> ToolResultsEnvelope | N
         return None
 
 
-def _step_snapshot(result: StepResult) -> dict[str, Any]:
+def _step_snapshot(
+    result: StepResult,
+    *,
+    timings: Mapping[str, JsonValue] | None = None,
+) -> dict[str, Any]:
     tool_requests_payload = (
         result.tool_requests or ToolRequestsEnvelope()
     ).model_dump(exclude_none=True)
@@ -363,6 +407,7 @@ def _step_snapshot(result: StepResult) -> dict[str, Any]:
         "tool_requests": tool_requests_payload,
         "final": final_payload,
         "error": error_payload,
+        "timings": dict(timings or {}),
     }
 
 
@@ -453,6 +498,45 @@ def _apply_tool_results(
         tool_status_state[key] = status
 
 
+def _build_state_summary(state: JsonValue | None, *, max_keys: int = 50) -> JsonValue | None:
+    if not isinstance(state, dict):
+        return None
+
+    def _limit(keys: list[str]) -> list[str]:
+        return sorted(keys)[:max_keys]
+
+    def _safe_count(value: JsonValue) -> int | None:
+        if isinstance(value, (list, dict, tuple, set)):
+            return len(value)
+        return None
+
+    summary: dict[str, JsonValue] = {"state_keys": _limit([str(k) for k in state.keys()])}
+
+    work = state.get("work")
+    if isinstance(work, dict):
+        work_keys = _limit([str(k) for k in work.keys()])
+        summary["work_keys"] = work_keys
+        work_counts: dict[str, JsonValue] = {}
+        for key in work_keys:
+            value = work.get(key)
+            count = _safe_count(value)
+            if count is not None:
+                work_counts[key] = count
+        if work_counts:
+            summary["work_counts"] = work_counts
+
+    tool_results = state.get("_tool_results")
+    if isinstance(tool_results, dict):
+        llm_bucket = tool_results.get("llm")
+        search_bucket = tool_results.get("search")
+        if isinstance(llm_bucket, dict):
+            summary["tool_llm_keys"] = _limit([str(k) for k in llm_bucket.keys()])
+        if isinstance(search_bucket, dict):
+            summary["tool_search_keys"] = _limit([str(k) for k in search_bucket.keys()])
+
+    return summary
+
+
 def _resolve_tool_requests(
     requests: ToolRequestsEnvelope,
     *,
@@ -465,11 +549,18 @@ def _resolve_tool_requests(
     search_backend: SearchBackend,
     doc_indexes: Sequence[int],
     doc_lengths: Sequence[int],
+    code_logger: code_log.CodeLogWriter | None = None,
+    max_concurrency: int = 4,
 ) -> tuple[ToolResultsEnvelope, dict[str, str]]:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     results = ToolResultsEnvelope()
     statuses: dict[str, str] = {}
 
-    for request in requests.llm:
+    max_concurrency = max(1, int(max_concurrency or 1))
+
+    llm_requests = list(requests.llm)
+    for request in llm_requests:
         prompt_len = len(request.prompt)
         if not tracker.can_accept_prompt(prompt_len):
             raise BudgetExceededError("BUDGET_EXCEEDED", "LLM prompt budget exceeded")
@@ -477,54 +568,90 @@ def _resolve_tool_requests(
             raise BudgetExceededError("BUDGET_EXCEEDED", "LLM subcall budget exceeded")
         tracker.record_prompt(prompt_len)
         tracker.record_subcalls(1)
-        try:
-            text = provider.complete_subcall(
-                request.prompt,
-                model,
-                request.max_tokens,
-                request.temperature,
-                tenant_id=tenant_id,
-            )
-            results.llm[request.key] = LLMToolResult(text=text, meta={"model": model})
-            statuses[request.key] = "resolved"
-        except Exception as exc:  # noqa: BLE001
-            results.llm[request.key] = LLMToolResult(
-                text="",
-                meta={"error": str(exc)},
-            )
-            statuses[request.key] = "error"
 
-    for request in requests.search:
-        if not enable_search:
-            results.search[request.key] = SearchToolResult(
-                hits=[],
-                meta=search_disabled_error_meta(),
-            )
-            statuses[request.key] = "error"
-            continue
-        try:
-            hits = search_backend.search(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                request=request,
-                doc_indexes=doc_indexes,
-                doc_lengths=doc_lengths,
-            )
-            results.search[request.key] = SearchToolResult(
-                hits=hits,
-                meta={"query": request.query},
-            )
-            statuses[request.key] = "resolved"
-        except Exception as exc:  # noqa: BLE001
-            results.search[request.key] = SearchToolResult(
-                hits=[],
-                meta=build_error_meta(
-                    ErrorCode.INTERNAL_ERROR,
-                    "Search backend error",
-                    details={"error": str(exc)},
-                ),
-            )
-            statuses[request.key] = "error"
+    search_requests = list(requests.search)
+    if not llm_requests and not search_requests:
+        return results, statuses
+
+    def _run_llm(request: Any) -> str:
+        return provider.complete_subcall(
+            request.prompt,
+            model,
+            request.max_tokens,
+            request.temperature,
+            tenant_id=tenant_id,
+        )
+
+    def _run_search(request: Any) -> list[JsonValue]:
+        return search_backend.search(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            request=request,
+            doc_indexes=doc_indexes,
+            doc_lengths=doc_lengths,
+        )
+
+    with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
+        future_map: dict[Any, tuple[str, Any]] = {}
+        for request in llm_requests:
+            future = executor.submit(_run_llm, request)
+            future_map[future] = ("llm", request)
+        for request in search_requests:
+            if not enable_search:
+                results.search[request.key] = SearchToolResult(
+                    hits=[],
+                    meta=search_disabled_error_meta(),
+                )
+                statuses[request.key] = "error"
+                continue
+            future = executor.submit(_run_search, request)
+            future_map[future] = ("search", request)
+
+        for future in as_completed(future_map):
+            tool_type, request = future_map[future]
+            try:
+                payload = future.result()
+                if tool_type == "llm":
+                    text = str(payload)
+                    if code_logger is not None:
+                        repl_code = code_log.extract_repl_code(text) or text
+                        code_logger.write(
+                            [
+                                code_log.build_repl_entry(
+                                    source="SUB",
+                                    model_name=model,
+                                    content=repl_code,
+                                )
+                            ]
+                        )
+                    results.llm[request.key] = LLMToolResult(
+                        text=text, meta={"model": model}
+                    )
+                    statuses[request.key] = "resolved"
+                else:
+                    hits = payload
+                    results.search[request.key] = SearchToolResult(
+                        hits=hits,
+                        meta={"query": request.query},
+                    )
+                    statuses[request.key] = "resolved"
+            except Exception as exc:  # noqa: BLE001
+                if tool_type == "llm":
+                    results.llm[request.key] = LLMToolResult(
+                        text="",
+                        meta={"error": str(exc)},
+                    )
+                    statuses[request.key] = "error"
+                else:
+                    results.search[request.key] = SearchToolResult(
+                        hits=[],
+                        meta=build_error_meta(
+                            ErrorCode.INTERNAL_ERROR,
+                            "Search backend error",
+                            details={"error": str(exc)},
+                        ),
+                    )
+                    statuses[request.key] = "error"
 
     return results, statuses
 
@@ -537,6 +664,7 @@ class OrchestratorWorker:
     s3_client: BaseClient
     provider: LLMProvider
     search_backend: SearchBackend = field(default_factory=FakeSearchBackend)
+    sandbox_runner: SandboxRunner | None = None
     logger: BoundLogger | None = None
     owner_id: str = field(default_factory=lambda: uuid4().hex)
     lease_duration_seconds: int = 30
@@ -546,6 +674,8 @@ class OrchestratorWorker:
             self.logger = get_logger("rlm_rs.orchestrator")
         if not self.settings.s3_bucket:
             raise ValueError("s3_bucket is required for orchestrator")
+        if self.sandbox_runner is None:
+            self.sandbox_runner = build_sandbox_runner(self.settings, logger=self.logger)
 
     def run_once(self, *, limit: int | None = None) -> int:
         executions_table = self.ddb_resource.Table(self.table_names.executions)
@@ -597,6 +727,163 @@ class OrchestratorWorker:
             return False
         return item.get("status") == "RUNNING"
 
+    def _build_trace_documents(
+        self, documents: Sequence[Mapping[str, Any]]
+    ) -> list[dict[str, JsonValue]]:
+        payload: list[dict[str, JsonValue]] = []
+        for item in documents:
+            payload.append(
+                state_store.normalize_json_value(
+                    {
+                        "doc_id": item.get("doc_id"),
+                        "doc_index": item.get("doc_index"),
+                        "source_name": item.get("source_name"),
+                        "mime_type": item.get("mime_type"),
+                        "text_s3_uri": item.get("text_s3_uri"),
+                        "meta_s3_uri": item.get("meta_s3_uri"),
+                        "offsets_s3_uri": item.get("offsets_s3_uri"),
+                        "char_length": item.get("char_length"),
+                        "byte_length": item.get("byte_length"),
+                        "page_count": item.get("page_count"),
+                        "parser_version": item.get("parser_version"),
+                        "text_checksum": item.get("text_checksum"),
+                        "ingest_status": item.get("ingest_status"),
+                    }
+                )
+            )
+        return payload
+
+    def _build_trace_session(
+        self, session_item: Mapping[str, Any]
+    ) -> dict[str, JsonValue]:
+        return state_store.normalize_json_value(
+            {
+                "session_id": session_item.get("session_id"),
+                "tenant_id": session_item.get("tenant_id"),
+                "status": session_item.get("status"),
+                "options": session_item.get("options"),
+                "models_default": session_item.get("models_default"),
+                "budgets_default": session_item.get("budgets_default"),
+                "created_at": session_item.get("created_at"),
+                "expires_at": session_item.get("expires_at"),
+            }
+        )
+
+    def _build_trace_execution(
+        self,
+        *,
+        execution_item: Mapping[str, Any],
+        status: str,
+        answer: str | None,
+        budgets_consumed: dict[str, JsonValue] | None,
+        completed_at: str,
+        duration_ms: int | None,
+    ) -> dict[str, JsonValue]:
+        return state_store.normalize_json_value(
+            {
+                "execution_id": execution_item.get("execution_id"),
+                "session_id": execution_item.get("session_id"),
+                "tenant_id": execution_item.get("tenant_id"),
+                "mode": execution_item.get("mode"),
+                "status": status,
+                "question": execution_item.get("question"),
+                "answer": answer,
+                "budgets_requested": execution_item.get("budgets_requested"),
+                "budgets_consumed": budgets_consumed,
+                "models": execution_item.get("models"),
+                "options": execution_item.get("options"),
+                "started_at": execution_item.get("started_at"),
+                "completed_at": completed_at,
+                "duration_ms": duration_ms,
+            }
+        )
+
+    def _finalize_execution(
+        self,
+        executions_table: Any,
+        evaluations_table: Any,
+        *,
+        execution_item: Mapping[str, Any],
+        session_item: Mapping[str, Any] | None,
+        documents: Sequence[Mapping[str, Any]] | None,
+        status: str,
+        tracker: BudgetTracker | None,
+        trace_collector: TraceCollector | None,
+        answer: str | None = None,
+        citations: list[dict[str, JsonValue]] | None = None,
+        duration_ms: int | None = None,
+    ) -> None:
+        budgets_consumed = None
+        if tracker is not None:
+            consumed = BudgetsConsumed(
+                turns=tracker.turns,
+                llm_subcalls=tracker.llm_subcalls,
+                total_seconds=tracker.elapsed_seconds(),
+            )
+            budgets_consumed = consumed.model_dump(exclude_none=True)
+        completed_at = _format_timestamp(_utc_now())
+        trace_s3_uri: str | None = None
+        if (
+            trace_collector is not None
+            and session_item is not None
+            and documents is not None
+            and execution_item.get("mode") == "ANSWERER"
+        ):
+            evaluation_item = ddb.get_evaluation(
+                evaluations_table,
+                execution_id=str(execution_item.get("execution_id")),
+            )
+            execution_payload = self._build_trace_execution(
+                execution_item=execution_item,
+                status=status,
+                answer=answer,
+                budgets_consumed=budgets_consumed,
+                completed_at=completed_at,
+                duration_ms=duration_ms,
+            )
+            session_payload = self._build_trace_session(session_item)
+            documents_payload = self._build_trace_documents(documents)
+            evaluation_payload = (
+                state_store.normalize_json_value(evaluation_item)
+                if evaluation_item
+                else None
+            )
+            artifact = trace_collector.build_artifact(
+                execution=execution_payload,
+                session=session_payload,
+                documents=documents_payload,
+                evaluation=evaluation_payload,
+            )
+            try:
+                trace_s3_uri = persist_trace_artifact(
+                    s3_client=self.s3_client,
+                    bucket=self.settings.s3_bucket,
+                    tenant_id=str(execution_item.get("tenant_id")),
+                    execution_id=str(execution_item.get("execution_id")),
+                    artifact=artifact,
+                )
+            except Exception as exc:  # noqa: BLE001
+                if self.logger is not None:
+                    self.logger.warning(
+                        "execution_trace_persist_failed",
+                        execution_id=str(execution_item.get("execution_id")),
+                        error=str(exc),
+                    )
+
+        ddb.update_execution_status(
+            executions_table,
+            session_id=str(execution_item.get("session_id")),
+            execution_id=str(execution_item.get("execution_id")),
+            expected_status="RUNNING",
+            new_status=status,
+            answer=answer,
+            citations=citations,
+            trace_s3_uri=trace_s3_uri,
+            budgets_consumed=budgets_consumed,
+            completed_at=completed_at,
+            duration_ms=duration_ms,
+        )
+
     def _run_execution(self, execution_item: Mapping[str, Any]) -> bool:
         session_id = str(execution_item.get("session_id") or "")
         execution_id = str(execution_item.get("execution_id") or "")
@@ -609,6 +896,15 @@ class OrchestratorWorker:
         documents_table = self.ddb_resource.Table(self.table_names.documents)
         executions_table = self.ddb_resource.Table(self.table_names.executions)
         execution_state_table = self.ddb_resource.Table(self.table_names.execution_state)
+        evaluations_table = self.ddb_resource.Table(self.table_names.evaluations)
+        code_log_table = self.ddb_resource.Table(self.table_names.code_log)
+        code_logger = code_log.CodeLogWriter(
+            table=code_log_table,
+            execution_id=execution_id,
+            settings=self.settings,
+            logger=self.logger,
+        )
+        trace_collector = TraceCollector(settings=self.settings)
 
         if not self._is_execution_running(
             executions_table,
@@ -623,35 +919,44 @@ class OrchestratorWorker:
             session_id=session_id,
         )
         if session_item is None:
-            self._finalize_status(
+            self._finalize_execution(
                 executions_table,
-                session_id=session_id,
-                execution_id=execution_id,
+                evaluations_table,
+                execution_item=execution_item,
+                session_item=None,
+                documents=None,
                 status="FAILED",
                 tracker=None,
+                trace_collector=None,
             )
             return True
 
         documents = _query_documents(documents_table, session_id)
         if not documents:
-            self._finalize_status(
+            self._finalize_execution(
                 executions_table,
-                session_id=session_id,
-                execution_id=execution_id,
+                evaluations_table,
+                execution_item=execution_item,
+                session_item=session_item,
+                documents=None,
                 status="FAILED",
                 tracker=None,
+                trace_collector=trace_collector,
             )
             return True
 
         models = _resolve_models(execution_item, session_item, self.settings)
         budgets = _resolve_budgets(execution_item, session_item, self.settings)
         if models is None or not models.root_model:
-            self._finalize_status(
+            self._finalize_execution(
                 executions_table,
-                session_id=session_id,
-                execution_id=execution_id,
+                evaluations_table,
+                execution_item=execution_item,
+                session_item=session_item,
+                documents=documents,
                 status="FAILED",
                 tracker=None,
+                trace_collector=trace_collector,
             )
             return True
 
@@ -662,12 +967,15 @@ class OrchestratorWorker:
         try:
             context_manifest = _build_context_manifest(documents)
         except ValueError:
-            self._finalize_status(
+            self._finalize_execution(
                 executions_table,
-                session_id=session_id,
-                execution_id=execution_id,
+                evaluations_table,
+                execution_item=execution_item,
+                session_item=session_item,
+                documents=documents,
                 status="FAILED",
                 tracker=None,
+                trace_collector=trace_collector,
             )
             return True
 
@@ -675,48 +983,60 @@ class OrchestratorWorker:
         doc_indexes = _doc_indexes(documents)
         state_item = ddb.get_execution_state(execution_state_table, execution_id=execution_id)
         if state_item is None:
-            self._finalize_status(
+            self._finalize_execution(
                 executions_table,
-                session_id=session_id,
-                execution_id=execution_id,
+                evaluations_table,
+                execution_item=execution_item,
+                session_item=session_item,
+                documents=documents,
                 status="FAILED",
                 tracker=None,
+                trace_collector=trace_collector,
             )
             return True
 
         try:
             state_payload = _load_state_payload(state_item, s3_client=self.s3_client)
         except Exception:  # noqa: BLE001
-            self._finalize_status(
+            self._finalize_execution(
                 executions_table,
-                session_id=session_id,
-                execution_id=execution_id,
+                evaluations_table,
+                execution_item=execution_item,
+                session_item=session_item,
+                documents=documents,
                 status="FAILED",
                 tracker=None,
+                trace_collector=trace_collector,
             )
             return True
 
         if state_payload is None:
             state_payload = {}
         if not isinstance(state_payload, dict):
-            self._finalize_status(
+            self._finalize_execution(
                 executions_table,
-                session_id=session_id,
-                execution_id=execution_id,
+                evaluations_table,
+                execution_item=execution_item,
+                session_item=session_item,
+                documents=documents,
                 status="FAILED",
                 tracker=None,
+                trace_collector=trace_collector,
             )
             return True
 
         try:
             _ensure_tool_state(state_payload)
         except state_store.StateValidationError:
-            self._finalize_status(
+            self._finalize_execution(
                 executions_table,
-                session_id=session_id,
-                execution_id=execution_id,
+                evaluations_table,
+                execution_item=execution_item,
+                session_item=session_item,
+                documents=documents,
                 status="FAILED",
                 tracker=None,
+                trace_collector=trace_collector,
             )
             return True
 
@@ -742,28 +1062,55 @@ class OrchestratorWorker:
             ):
                 return True
             if tracker.over_max_turns():
-                self._finalize_status(
+                self._finalize_execution(
                     executions_table,
-                    session_id=session_id,
-                    execution_id=execution_id,
+                    evaluations_table,
+                    execution_item=execution_item,
+                    session_item=session_item,
+                    documents=documents,
                     status="MAX_TURNS_EXCEEDED",
                     tracker=tracker,
+                    trace_collector=trace_collector,
                     duration_ms=self._duration_ms(execution_start),
                 )
                 return True
             if tracker.over_total_seconds():
-                self._finalize_status(
+                self._finalize_execution(
                     executions_table,
-                    session_id=session_id,
-                    execution_id=execution_id,
+                    evaluations_table,
+                    execution_item=execution_item,
+                    session_item=session_item,
+                    documents=documents,
                     status="BUDGET_EXCEEDED",
                     tracker=tracker,
+                    trace_collector=trace_collector,
                     duration_ms=self._duration_ms(execution_start),
                 )
                 return True
 
+            turn_timings: dict[str, int] = {}
+            if isinstance(state_payload, dict):
+                state_payload["_tool_schema"] = build_tool_schema(
+                    subcalls_enabled=subcalls_enabled,
+                    search_enabled=enable_search,
+                )
             budget_snapshot = tracker.snapshot()
             state_payload["_budgets"] = budget_snapshot
+            state_summary = None
+            if self.settings.enable_root_state_summary:
+                state_summary = _build_state_summary(state_payload)
+            root_prompt_inputs = {
+                "question": question,
+                "doc_count": len(doc_lengths_chars),
+                "doc_lengths_chars": list(doc_lengths_chars),
+                "budget_snapshot": budget_snapshot,
+                "last_stdout": last_stdout or None,
+                "last_error": last_error,
+                "state_summary": state_summary,
+                "subcalls_enabled": subcalls_enabled,
+            }
+            prompt_version = root_prompt_version(subcalls_enabled=subcalls_enabled)
+            prompt_start = time.perf_counter()
             prompt = build_root_prompt(
                 question=question,
                 doc_count=len(doc_lengths_chars),
@@ -771,32 +1118,75 @@ class OrchestratorWorker:
                 budget_snapshot=budget_snapshot,
                 last_stdout=last_stdout or None,
                 last_error=last_error,
+                state_summary=state_summary,
                 subcalls_enabled=subcalls_enabled,
+            )
+            turn_timings["prompt_build_ms"] = _elapsed_ms(prompt_start)
+            trace_collector.start_turn(
+                turn_index=turn_index,
+                root_prompt=prompt,
+                root_prompt_version=prompt_version,
+                root_prompt_inputs=root_prompt_inputs,
+                budget_snapshot=budget_snapshot,
             )
             prompt_len = len(prompt)
             if not tracker.can_accept_prompt(prompt_len):
-                self._finalize_status(
+                self._finalize_execution(
                     executions_table,
-                    session_id=session_id,
-                    execution_id=execution_id,
+                    evaluations_table,
+                    execution_item=execution_item,
+                    session_item=session_item,
+                    documents=documents,
                     status="BUDGET_EXCEEDED",
                     tracker=tracker,
+                    trace_collector=trace_collector,
                     duration_ms=self._duration_ms(execution_start),
                 )
                 return True
 
+            root_call_start = time.perf_counter()
             root_output = self.provider.complete_root(
                 prompt,
                 root_model,
                 tenant_id=tenant_id,
             )
+            turn_timings["root_call_ms"] = _elapsed_ms(root_call_start)
             tracker.record_prompt(prompt_len)
+            parse_start = time.perf_counter()
             try:
                 code = parse_root_output(root_output)
             except ValueError as exc:
+                turn_timings["root_parse_ms"] = _elapsed_ms(parse_start)
                 last_error = str(exc)
+                code_logger.write(
+                    [code_log.build_repl_parse_error_entry(
+                        model_name=root_model,
+                        error=str(exc),
+                        output=root_output,
+                    )]
+                )
+                trace_collector.record_parse_error(
+                    turn_index=turn_index,
+                    error=str(exc),
+                    output=root_output,
+                    root_prompt=prompt,
+                    root_prompt_version=prompt_version,
+                    root_prompt_inputs=root_prompt_inputs,
+                    timings=turn_timings,
+                )
                 tracker.record_turn()
                 continue
+            turn_timings["root_parse_ms"] = _elapsed_ms(parse_start)
+            code_logger.write(
+                [
+                    code_log.build_repl_entry(
+                        source="ROOT",
+                        model_name=root_model,
+                        content=code,
+                    )
+                ]
+            )
+            trace_collector.record_repl_code(turn_index=turn_index, repl_code=code)
 
             event = StepEvent(
                 tenant_id=tenant_id,
@@ -810,12 +1200,16 @@ class OrchestratorWorker:
                 limits=limits,
             )
 
-            result = execute_step(
+            sandbox_start = time.perf_counter()
+            result = self.sandbox_runner.run(
                 event,
                 s3_client=self.s3_client,
                 region=self.settings.aws_region,
                 endpoint_url=self.settings.localstack_endpoint_url,
             )
+            turn_timings["sandbox_ms"] = _elapsed_ms(sandbox_start)
+            if result.tool_requests:
+                code_logger.write(code_log.build_tool_request_entries(result.tool_requests))
             span_log.extend(result.span_log)
             tracker.record_turn()
 
@@ -826,17 +1220,21 @@ class OrchestratorWorker:
                 try:
                     _ensure_tool_state(next_state)
                 except state_store.StateValidationError:
-                    self._finalize_status(
+                    self._finalize_execution(
                         executions_table,
-                        session_id=session_id,
-                        execution_id=execution_id,
+                        evaluations_table,
+                        execution_item=execution_item,
+                        session_item=session_item,
+                        documents=documents,
                         status="FAILED",
                         tracker=tracker,
+                        trace_collector=trace_collector,
                         duration_ms=self._duration_ms(execution_start),
                     )
                     return True
                 next_state["_budgets"] = tracker.snapshot()
 
+            state_persist_start = time.perf_counter()
             try:
                 state_record = state_store.persist_state_payload(
                     state=next_state,
@@ -847,18 +1245,29 @@ class OrchestratorWorker:
                     bucket=self.settings.s3_bucket,
                 )
             except (state_store.StateValidationError, state_store.StateOffloadError):
-                self._finalize_status(
+                self._finalize_execution(
                     executions_table,
-                    session_id=session_id,
-                    execution_id=execution_id,
+                    evaluations_table,
+                    execution_item=execution_item,
+                    session_item=session_item,
+                    documents=documents,
                     status="FAILED",
                     tracker=tracker,
+                    trace_collector=trace_collector,
                     duration_ms=self._duration_ms(execution_start),
                 )
                 return True
+            turn_timings["state_persist_ms"] = _elapsed_ms(state_persist_start)
 
             updated_at = _format_timestamp(_utc_now())
-            step_snapshot = _step_snapshot(result)
+            step_snapshot = _step_snapshot(result, timings=turn_timings)
+            trace_collector.record_step_result(
+                turn_index=turn_index,
+                result=result,
+                state_summary=state_record.summary,
+                checksum=state_record.checksum,
+                timings=turn_timings,
+            )
             ddb.put_execution_state(
                 execution_state_table,
                 execution_id=execution_id,
@@ -897,34 +1306,71 @@ class OrchestratorWorker:
                 return True
 
             if result.final and result.final.is_final:
+                documents_text: list[DocumentText] = []
+                citations_payload: list[dict[str, JsonValue]] = []
+                citeable_spans = [
+                    span for span in span_log if not (span.tag or "").startswith("scan:")
+                ]
+                if not citeable_spans and self.logger is not None:
+                    self.logger.warning(
+                        "citations_missing_no_citeable_spans",
+                        execution_id=execution_id,
+                        span_count=len(span_log),
+                    )
                 try:
                     documents_text = _load_documents_text(documents, self.s3_client)
-                    citations = make_spanrefs(
-                        span_log=span_log,
-                        documents=documents_text,
-                        tenant_id=tenant_id,
-                        session_id=session_id,
-                    )
-                    citations_payload = [
-                        citation.model_dump(exclude_none=True) for citation in citations
-                    ]
-                except Exception:  # noqa: BLE001
+                    if citeable_spans:
+                        citations = make_spanrefs(
+                            span_log=span_log,
+                            documents=documents_text,
+                            tenant_id=tenant_id,
+                            session_id=session_id,
+                        )
+                        citations_payload = [
+                            citation.model_dump(exclude_none=True) for citation in citations
+                        ]
+                except Exception as exc:  # noqa: BLE001
+                    if self.logger is not None:
+                        self.logger.warning(
+                            "citations_build_failed",
+                            execution_id=execution_id,
+                            error=str(exc),
+                            span_count=len(span_log),
+                            citeable_span_count=len(citeable_spans),
+                        )
                     citations_payload = []
-                self._finalize_status(
+                self._finalize_execution(
                     executions_table,
-                    session_id=session_id,
-                    execution_id=execution_id,
+                    evaluations_table,
+                    execution_item=execution_item,
+                    session_item=session_item,
+                    documents=documents,
                     status="COMPLETED",
+                    tracker=tracker,
+                    trace_collector=trace_collector,
                     answer=result.final.answer or "",
                     citations=citations_payload,
-                    tracker=tracker,
                     duration_ms=self._duration_ms(execution_start),
+                )
+                self._create_evaluation_record(
+                    evaluations_table,
+                    execution_item=execution_item,
+                    session_id=session_id,
+                    execution_id=execution_id,
+                    tenant_id=tenant_id,
+                    question=question,
+                    answer=result.final.answer or "",
+                    models=models,
+                    documents=documents,
+                    span_log=span_log,
+                    documents_text=documents_text,
                 )
                 return True
 
             if not result.success or not result.tool_requests:
                 continue
 
+            tool_resolve_start = time.perf_counter()
             try:
                 tool_results, statuses = _resolve_tool_requests(
                     result.tool_requests,
@@ -937,21 +1383,36 @@ class OrchestratorWorker:
                     search_backend=self.search_backend,
                     doc_indexes=doc_indexes,
                     doc_lengths=doc_lengths_chars,
+                    code_logger=code_logger,
+                    max_concurrency=self.settings.tool_resolution_max_concurrency,
                 )
             except BudgetExceededError:
-                self._finalize_status(
+                self._finalize_execution(
                     executions_table,
-                    session_id=session_id,
-                    execution_id=execution_id,
+                    evaluations_table,
+                    execution_item=execution_item,
+                    session_item=session_item,
+                    documents=documents,
                     status="BUDGET_EXCEEDED",
                     tracker=tracker,
+                    trace_collector=trace_collector,
                     duration_ms=self._duration_ms(execution_start),
                 )
                 return True
+            turn_timings["tool_resolve_ms"] = _elapsed_ms(tool_resolve_start)
+            code_logger.write(code_log.build_tool_result_entries(tool_results, statuses))
+            trace_collector.record_tool_results(
+                turn_index=turn_index - 1,
+                tool_results=tool_results,
+                tool_status=statuses,
+            )
 
             try:
+                tool_apply_start = time.perf_counter()
                 _apply_tool_results(state_payload, tool_results, statuses)
+                turn_timings["tool_apply_ms"] = _elapsed_ms(tool_apply_start)
                 state_payload["_budgets"] = tracker.snapshot()
+                tool_state_persist_start = time.perf_counter()
                 state_record = state_store.persist_state_payload(
                     state=state_payload,
                     tenant_id=tenant_id,
@@ -960,18 +1421,23 @@ class OrchestratorWorker:
                     s3_client=self.s3_client,
                     bucket=self.settings.s3_bucket,
                 )
+                turn_timings["tool_state_persist_ms"] = _elapsed_ms(tool_state_persist_start)
             except state_store.StateValidationError:
-                self._finalize_status(
+                self._finalize_execution(
                     executions_table,
-                    session_id=session_id,
-                    execution_id=execution_id,
+                    evaluations_table,
+                    execution_item=execution_item,
+                    session_item=session_item,
+                    documents=documents,
                     status="FAILED",
                     tracker=tracker,
+                    trace_collector=trace_collector,
                     duration_ms=self._duration_ms(execution_start),
                 )
                 return True
 
             updated_at = _format_timestamp(_utc_now())
+            step_snapshot["timings"] = dict(turn_timings)
             ddb.put_execution_state(
                 execution_state_table,
                 execution_id=execution_id,
@@ -996,42 +1462,319 @@ class OrchestratorWorker:
                 summary=state_record.summary,
                 **step_snapshot,
             )
+            trace_collector.record_step_result(
+                turn_index=turn_index - 1,
+                result=result,
+                state_summary=state_record.summary,
+                checksum=state_record.checksum,
+                timings=turn_timings,
+            )
 
     def _duration_ms(self, start_time: float) -> int:
         return int((time.monotonic() - start_time) * 1000)
 
-    def _finalize_status(
+    def _create_evaluation_record(
         self,
-        executions_table: Any,
+        evaluations_table: Any,
         *,
+        execution_item: Mapping[str, Any],
         session_id: str,
         execution_id: str,
-        status: str,
-        tracker: BudgetTracker | None,
-        answer: str | None = None,
-        citations: list[dict[str, JsonValue]] | None = None,
-        duration_ms: int | None = None,
+        tenant_id: str,
+        question: str,
+        answer: str,
+        models: ModelsConfig,
+        documents: Sequence[Mapping[str, Any]],
+        span_log: Sequence[SpanLogEntry] | None = None,
+        documents_text: Sequence[DocumentText] | None = None,
     ) -> None:
-        budgets_consumed = None
-        if tracker is not None:
-            consumed = BudgetsConsumed(
-                turns=tracker.turns,
-                llm_subcalls=tracker.llm_subcalls,
-                total_seconds=tracker.elapsed_seconds(),
+        mode = str(execution_item.get("mode") or "ANSWERER")
+        if mode != "ANSWERER":
+            return
+
+        evaluation_id = f"eval_{uuid4().hex}"
+        created_at = _format_timestamp(_utc_now())
+        try:
+            ddb.create_evaluation(
+                evaluations_table,
+                evaluation_id=evaluation_id,
+                tenant_id=tenant_id,
+                session_id=session_id,
+                execution_id=execution_id,
+                mode=mode,
+                question=question,
+                answer=answer,
+                baseline_status="RUNNING",
+                baseline_skip_reason=None,
+                baseline_answer=None,
+                baseline_input_tokens=None,
+                baseline_context_window=None,
+                judge_metrics=None,
+                created_at=created_at,
             )
-            budgets_consumed = consumed.model_dump(exclude_none=True)
-        ddb.update_execution_status(
-            executions_table,
+        except Exception as exc:  # noqa: BLE001
+            if self.logger is not None:
+                self.logger.warning(
+                    "baseline_evaluation_seed_failed",
+                    execution_id=execution_id,
+                    error=str(exc),
+                )
+
+        baseline_status = "SKIPPED"
+        baseline_skip_reason: str | None = None
+        baseline_answer: str | None = None
+        baseline_input_tokens: int | None = None
+        baseline_context_window: int | None = None
+        judge_metrics = None
+
+        try:
+            baseline_check = baseline_eval.prepare_baseline_prompt(
+                mode=mode,
+                model=models.root_model,
+                question=question,
+                documents=documents,
+                s3_client=self.s3_client,
+                settings=self.settings,
+            )
+        except Exception as exc:  # noqa: BLE001
+            baseline_skip_reason = "BASELINE_ERROR"
+            if self.logger is not None:
+                self.logger.warning(
+                    "baseline_prompt_failed",
+                    execution_id=execution_id,
+                    error=str(exc),
+                )
+        else:
+            baseline_input_tokens = baseline_check.input_tokens
+            baseline_context_window = baseline_check.context_window
+            baseline_skip_reason = baseline_check.skip_reason
+            if baseline_check.skip_reason is None and baseline_check.prompt is not None:
+                try:
+                    baseline_answer = self.provider.complete_baseline(
+                        baseline_check.prompt,
+                        models.root_model,
+                        tenant_id=tenant_id,
+                    )
+                    baseline_status = "COMPLETED"
+                    baseline_skip_reason = None
+                except Exception as exc:  # noqa: BLE001
+                    baseline_skip_reason = "BASELINE_ERROR"
+                    if self.logger is not None:
+                        self.logger.warning(
+                            "baseline_completion_failed",
+                            execution_id=execution_id,
+                            error=str(exc),
+                        )
+
+        if self.settings.enable_eval_judge:
+            answerer_contexts = []
+            if span_log and documents_text:
+                answerer_contexts = eval_judge.build_answerer_contexts(
+                    span_log,
+                    documents_text,
+                )
+            baseline_contexts: list[str] = []
+            if documents_text:
+                baseline_contexts = eval_judge.build_baseline_contexts(
+                    question=question,
+                    answer=baseline_answer,
+                    documents=documents_text,
+                )
+            judge_metrics = eval_judge.evaluate_judge(
+                question=question,
+                answer=answer,
+                answerer_contexts=answerer_contexts,
+                baseline_answer=baseline_answer,
+                baseline_contexts=baseline_contexts,
+                settings=self.settings,
+                logger=self.logger,
+            )
+
+        judge_payload = None
+        if judge_metrics is not None:
+            judge_payload = judge_metrics.model_dump(exclude_none=True)
+
+        try:
+            updated = ddb.update_evaluation(
+                evaluations_table,
+                execution_id=execution_id,
+                baseline_status=baseline_status,
+                baseline_skip_reason=baseline_skip_reason,
+                baseline_answer=baseline_answer,
+                baseline_input_tokens=baseline_input_tokens,
+                baseline_context_window=baseline_context_window,
+                judge_metrics=judge_payload,
+            )
+            if not updated and self.logger is not None:
+                self.logger.warning(
+                    "baseline_evaluation_missing",
+                    execution_id=execution_id,
+                )
+        except Exception as exc:  # noqa: BLE001
+            if self.logger is not None:
+                self.logger.warning(
+                    "baseline_evaluation_update_failed",
+                    execution_id=execution_id,
+                    error=str(exc),
+                )
+
+    def recompute_evaluation(
+        self,
+        *,
+        execution_id: str,
+        tenant_id: str | None = None,
+        recompute_baseline: bool = False,
+    ) -> bool:
+        """Recompute evaluation artifacts for a completed Answerer execution.
+
+        - By default recomputes only LLM judge metrics (keeps baseline intact).
+        - When `recompute_baseline=True`, recomputes baseline + judge metrics (can be expensive).
+        """
+
+        executions_table = self.ddb_resource.Table(self.table_names.executions)
+        sessions_table = self.ddb_resource.Table(self.table_names.sessions)
+        documents_table = self.ddb_resource.Table(self.table_names.documents)
+        execution_state_table = self.ddb_resource.Table(self.table_names.execution_state)
+        evaluations_table = self.ddb_resource.Table(self.table_names.evaluations)
+
+        candidates = _scan_execution_items(executions_table, execution_id)
+        if tenant_id is not None:
+            candidates = [item for item in candidates if item.get("tenant_id") == tenant_id]
+        if not candidates:
+            return False
+        if len(candidates) > 1:
+            raise ValueError("Multiple executions found; pass tenant_id to disambiguate")
+
+        execution_item = candidates[0]
+        mode = str(execution_item.get("mode") or "")
+        if mode != "ANSWERER":
+            return False
+        status = str(execution_item.get("status") or "")
+        if status != "COMPLETED":
+            return False
+
+        resolved_tenant_id = str(execution_item.get("tenant_id") or "")
+        session_id = str(execution_item.get("session_id") or "")
+        question = str(execution_item.get("question") or "")
+        answer = str(execution_item.get("answer") or "")
+        if not resolved_tenant_id or not session_id:
+            return False
+
+        session_item = ddb.get_session(
+            sessions_table,
+            tenant_id=resolved_tenant_id,
             session_id=session_id,
-            execution_id=execution_id,
-            expected_status="RUNNING",
-            new_status=status,
-            answer=answer,
-            citations=citations,
-            budgets_consumed=budgets_consumed,
-            completed_at=_format_timestamp(_utc_now()),
-            duration_ms=duration_ms,
         )
+        if session_item is None:
+            return False
+
+        documents = _query_documents(documents_table, session_id)
+        if not documents:
+            return False
+
+        models = _resolve_models(execution_item, session_item, self.settings)
+        if models is None or not models.root_model:
+            return False
+
+        span_log = _load_execution_span_log(execution_state_table, execution_id)
+        documents_text: list[DocumentText] = []
+        try:
+            documents_text = _load_documents_text(documents, self.s3_client)
+        except Exception:  # noqa: BLE001
+            documents_text = []
+
+        if recompute_baseline:
+            self._create_evaluation_record(
+                evaluations_table,
+                execution_item=execution_item,
+                session_id=session_id,
+                execution_id=execution_id,
+                tenant_id=resolved_tenant_id,
+                question=question,
+                answer=answer,
+                models=models,
+                documents=documents,
+                span_log=span_log,
+                documents_text=documents_text,
+            )
+            return True
+
+        if not self.settings.enable_eval_judge:
+            raise ValueError("ENABLE_EVAL_JUDGE must be true to recompute judge metrics")
+
+        evaluation_item = ddb.get_evaluation(evaluations_table, execution_id=execution_id)
+        if evaluation_item is None:
+            created_at = _format_timestamp(_utc_now())
+            evaluation_id = f"eval_{uuid4().hex}"
+            try:
+                ddb.create_evaluation(
+                    evaluations_table,
+                    evaluation_id=evaluation_id,
+                    tenant_id=resolved_tenant_id,
+                    session_id=session_id,
+                    execution_id=execution_id,
+                    mode=mode,
+                    question=question,
+                    answer=answer,
+                    baseline_status="SKIPPED",
+                    baseline_skip_reason="MISSING_EVALUATION",
+                    baseline_answer=None,
+                    baseline_input_tokens=None,
+                    baseline_context_window=None,
+                    judge_metrics=None,
+                    created_at=created_at,
+                )
+            except Exception as exc:  # noqa: BLE001
+                if self.logger is not None:
+                    self.logger.warning(
+                        "evaluation_recompute_seed_failed",
+                        execution_id=execution_id,
+                        error=str(exc),
+                    )
+            evaluation_item = ddb.get_evaluation(evaluations_table, execution_id=execution_id)
+            if evaluation_item is None:
+                return False
+
+        baseline_status = str(evaluation_item.get("baseline_status") or "SKIPPED")
+        if baseline_status not in {"COMPLETED", "SKIPPED", "RUNNING"}:
+            baseline_status = "SKIPPED"
+
+        baseline_answer = evaluation_item.get("baseline_answer")
+        if not isinstance(baseline_answer, str) or not baseline_answer.strip():
+            baseline_answer = None
+
+        answerer_contexts: list[str] = []
+        if span_log and documents_text:
+            answerer_contexts = eval_judge.build_answerer_contexts(span_log, documents_text)
+
+        baseline_contexts: list[str] = []
+        if documents_text:
+            baseline_contexts = eval_judge.build_baseline_contexts(
+                question=question,
+                answer=baseline_answer,
+                documents=documents_text,
+            )
+
+        judge_metrics = eval_judge.evaluate_judge(
+            question=question,
+            answer=answer,
+            answerer_contexts=answerer_contexts,
+            baseline_answer=baseline_answer,
+            baseline_contexts=baseline_contexts,
+            settings=self.settings,
+            logger=self.logger,
+        )
+        if judge_metrics is None:
+            return False
+
+        judge_payload = judge_metrics.model_dump(exclude_none=True)
+        updated = ddb.update_evaluation(
+            evaluations_table,
+            execution_id=execution_id,
+            baseline_status=baseline_status,
+            judge_metrics=judge_payload,
+        )
+        return bool(updated)
 
 
 def build_worker(

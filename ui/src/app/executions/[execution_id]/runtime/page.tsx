@@ -11,6 +11,7 @@ import type {
 } from "../../../../lib/types";
 import { useApp } from "../../../../contexts/AppContext";
 import { useToast } from "../../../../contexts/ToastContext";
+import { CodeBlock } from "../../../../components/ui/CodeBlock";
 
 const TAB_OPTIONS = ["stdout", "state", "span_log", "tool_requests"] as const;
 const STATUS_STYLES: Record<string, string> = {
@@ -393,7 +394,7 @@ export default function RuntimeExecutionPage() {
         </div>
       </div>
 
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+      <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
         <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
@@ -544,9 +545,7 @@ export default function RuntimeExecutionPage() {
                         {run.errorMessage}
                       </div>
                     ) : null}
-                    <div className="rounded-xl border border-slate-200 bg-white p-3 font-mono text-xs text-slate-600">
-                      {run.code || "(empty)"}
-                    </div>
+                    <CodeBlock language="python" content={run.code || "(empty)"} />
                   </div>
                 </details>
               ))

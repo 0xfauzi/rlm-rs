@@ -162,6 +162,8 @@ def _table_names() -> DdbTableNames:
         documents="documents",
         executions="executions",
         execution_state="execution_state",
+        evaluations="evaluations",
+        code_log="code_log",
         api_keys="api_keys",
         audit_log="audit_log",
     )
@@ -226,6 +228,34 @@ def _seed_execution(
         mode=mode,
         question="hello?",
         started_at="2026-01-01T00:00:00Z",
+    )
+
+
+def _seed_evaluation(
+    resource: _FakeDdbResource,
+    *,
+    tenant_id: str,
+    session_id: str,
+    execution_id: str,
+    mode: str = "ANSWERER",
+) -> None:
+    tables = _table_names()
+    evaluations_table = resource.Table(tables.evaluations)
+    ddb.create_evaluation(
+        evaluations_table,
+        evaluation_id="eval-123",
+        tenant_id=tenant_id,
+        session_id=session_id,
+        execution_id=execution_id,
+        mode=mode,
+        question="What is the plan?",
+        answer="Answer here.",
+        baseline_status="SKIPPED",
+        baseline_skip_reason="MISSING_PARSED_TEXT",
+        baseline_answer=None,
+        baseline_input_tokens=None,
+        baseline_context_window=None,
+        created_at="2026-01-01T00:00:00Z",
     )
 
 
@@ -342,6 +372,103 @@ def test_get_execution_hides_trace_when_return_trace_disabled() -> None:
     assert response.status_code == 200
     data = response.json()
     assert data["trace_s3_uri"] is None
+
+
+def test_evaluation_api_returns_record() -> None:
+    resource = _FakeDdbResource()
+    tenant_id = "tenant-eval"
+    session_id = "sess-eval"
+    execution_id = "exec-eval"
+    _seed_ready_session(resource, tenant_id, session_id)
+    _seed_execution(
+        resource,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        execution_id=execution_id,
+    )
+    _seed_evaluation(
+        resource,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        execution_id=execution_id,
+    )
+
+    client = _build_client(tenant_id, resource)
+    response = client.get(f"/v1/executions/{execution_id}/evaluation")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["evaluation_id"] == "eval-123"
+    assert data["execution_id"] == execution_id
+    assert data["baseline_status"] == "SKIPPED"
+    assert data["baseline_skip_reason"] == "MISSING_PARSED_TEXT"
+
+
+def test_evaluation_api_missing_returns_404() -> None:
+    resource = _FakeDdbResource()
+    tenant_id = "tenant-missing"
+    session_id = "sess-missing"
+    execution_id = "exec-missing"
+    _seed_ready_session(resource, tenant_id, session_id)
+    _seed_execution(
+        resource,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        execution_id=execution_id,
+    )
+
+    client = _build_client(tenant_id, resource)
+    response = client.get(f"/v1/executions/{execution_id}/evaluation")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == ErrorCode.EXECUTION_NOT_FOUND
+
+
+def test_evaluation_api_runtime_returns_validation_error() -> None:
+    resource = _FakeDdbResource()
+    tenant_id = "tenant-runtime"
+    session_id = "sess-runtime"
+    execution_id = "exec-runtime"
+    _seed_ready_session(resource, tenant_id, session_id)
+    _seed_execution(
+        resource,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        execution_id=execution_id,
+        mode="RUNTIME",
+    )
+
+    client = _build_client(tenant_id, resource)
+    response = client.get(f"/v1/executions/{execution_id}/evaluation")
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == ErrorCode.VALIDATION_ERROR
+
+
+def test_evaluation_api_forbidden_for_other_tenant() -> None:
+    resource = _FakeDdbResource()
+    tenant_id = "tenant-owner"
+    session_id = "sess-owner"
+    execution_id = "exec-owner"
+    _seed_ready_session(resource, tenant_id, session_id)
+    _seed_execution(
+        resource,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        execution_id=execution_id,
+    )
+    _seed_evaluation(
+        resource,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        execution_id=execution_id,
+    )
+
+    client = _build_client("tenant-other", resource)
+    response = client.get(f"/v1/executions/{execution_id}/evaluation")
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == ErrorCode.FORBIDDEN
 
 
 def test_get_and_wait_execution_enforce_tenant_and_poll(monkeypatch: Any) -> None:

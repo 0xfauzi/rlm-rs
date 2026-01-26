@@ -41,6 +41,15 @@ class LLMProvider(Protocol):
     ) -> str:
         ...
 
+    def complete_baseline(
+        self,
+        prompt: str,
+        model: str | None,
+        *,
+        tenant_id: str | None = None,
+    ) -> str:
+        ...
+
     def complete_subcall(
         self,
         prompt: str,
@@ -84,6 +93,23 @@ class FakeLLMProvider:
         if self._root_outputs:
             return self._root_outputs.popleft()
         return self._default_root_output
+
+    def complete_baseline(
+        self,
+        prompt: str,
+        model: str | None,
+        *,
+        tenant_id: str | None = None,
+    ) -> str:
+        self.calls.append(
+            LLMCall(
+                prompt=prompt,
+                model=model,
+                max_tokens=None,
+                temperature=None,
+            )
+        )
+        return f"fake:{prompt}"
 
     def complete_subcall(
         self,
@@ -399,6 +425,28 @@ class OpenAIProvider:
         )
         self._log_completion(
             call_kind="root",
+            model=model,
+            text=text,
+            raw=raw,
+            tenant_id=tenant_id,
+        )
+        return text
+
+    def complete_baseline(
+        self,
+        prompt: str,
+        model: str | None,
+        *,
+        tenant_id: str | None = None,
+    ) -> str:
+        text, raw = self._chat_completion_with_meta(
+            prompt,
+            model,
+            max_tokens=None,
+            temperature=None,
+        )
+        self._log_completion(
+            call_kind="baseline",
             model=model,
             text=text,
             raw=raw,

@@ -63,10 +63,15 @@ class DocView:
         self._s3_client = s3_client
         self._span_logger = span_logger
         self._offsets: _OffsetsIndex | None = None
+        self._meta: dict[str, Any] | None = None
+        self._meta_bucket: str | None = None
+        self._meta_key: str | None = None
         self._text_bucket, self._text_key = _split_s3_uri(document.text_s3_uri)
         if not document.offsets_s3_uri:
             raise ValueError("offsets_s3_uri is required for DocView")
         self._offsets_bucket, self._offsets_key = _split_s3_uri(document.offsets_s3_uri)
+        if document.meta_s3_uri:
+            self._meta_bucket, self._meta_key = _split_s3_uri(document.meta_s3_uri)
 
     @property
     def doc_id(self) -> str:
@@ -89,6 +94,41 @@ class DocView:
             return self.slice(start, end, tag=None)
         raise TypeError("DocView indices must be int or slice")
 
+    def page_spans(self) -> list[dict[str, int]]:
+        meta = self._get_meta()
+        if not meta:
+            return []
+        pages = meta.get("pages")
+        if not isinstance(pages, list):
+            return []
+        spans: list[dict[str, int]] = []
+        for page in pages:
+            if not isinstance(page, dict):
+                continue
+            page_num = page.get("page_num")
+            start_char = page.get("start_char")
+            end_char = page.get("end_char")
+            if not isinstance(page_num, int):
+                continue
+            if not isinstance(start_char, int) or not isinstance(end_char, int):
+                continue
+            spans.append(
+                {"page_num": page_num, "start_char": start_char, "end_char": end_char}
+            )
+        return spans
+
+    def sections(self) -> list[dict[str, Any]]:
+        meta = self._get_meta()
+        if not meta:
+            return []
+        structure = meta.get("structure")
+        if not isinstance(structure, dict):
+            return []
+        children = structure.get("children")
+        if not isinstance(children, list):
+            return []
+        return [child for child in children if isinstance(child, dict)]
+
     def find(
         self,
         term: str,
@@ -102,6 +142,14 @@ class DocView:
         start_char, end_char = self._normalize_range(start, end)
         if start_char >= end_char:
             return []
+        self._span_logger(
+            SpanLogEntry(
+                doc_index=self._document.doc_index,
+                start_char=start_char,
+                end_char=end_char,
+                tag="scan:find",
+            )
+        )
         offsets = self._get_offsets()
         checkpoints = offsets.checkpoints
         chars = [checkpoint.char for checkpoint in checkpoints]
@@ -165,6 +213,14 @@ class DocView:
             compiled = re.compile(pattern)
         except re.error:
             return []
+        self._span_logger(
+            SpanLogEntry(
+                doc_index=self._document.doc_index,
+                start_char=start_char,
+                end_char=end_char,
+                tag="scan:regex",
+            )
+        )
         text = self._read_range(start_char, end_char)
         hits: list[dict[str, int]] = []
         for match in compiled.finditer(text):
@@ -199,6 +255,23 @@ class DocView:
                 raise ValueError("Offsets payload must be a JSON object")
             self._offsets = _OffsetsIndex(payload)
         return self._offsets
+
+    def _get_meta(self) -> dict[str, Any]:
+        if self._meta is not None:
+            return self._meta
+        if not self._meta_bucket or not self._meta_key:
+            self._meta = {}
+            return self._meta
+        try:
+            payload = get_json(self._s3_client, self._meta_bucket, self._meta_key)
+        except Exception:  # noqa: BLE001
+            self._meta = {}
+            return self._meta
+        if not isinstance(payload, dict):
+            self._meta = {}
+            return self._meta
+        self._meta = payload
+        return self._meta
 
     def _normalize_range(self, start: int | None, end: int | None) -> tuple[int, int]:
         length = self._get_offsets().char_length

@@ -44,6 +44,15 @@ class Settings(BaseSettings):
     parser_service_auth_secret_arn: str | None = Field(
         default=None, validation_alias=AliasChoices("PARSER_SERVICE_AUTH_SECRET_ARN")
     )
+    sandbox_runner: str | None = Field(
+        default="local", validation_alias=AliasChoices("SANDBOX_RUNNER")
+    )
+    sandbox_lambda_function_name: str | None = Field(
+        default=None, validation_alias=AliasChoices("SANDBOX_LAMBDA_FUNCTION_NAME")
+    )
+    sandbox_lambda_timeout_seconds: float | None = Field(
+        default=None, validation_alias=AliasChoices("SANDBOX_LAMBDA_TIMEOUT_SECONDS")
+    )
     api_key_pepper: str | None = Field(
         default=None, validation_alias=AliasChoices("API_KEY_PEPPER")
     )
@@ -77,6 +86,10 @@ class Settings(BaseSettings):
     default_models_json: JsonValue | None = Field(
         default=None, validation_alias=AliasChoices("DEFAULT_MODELS_JSON")
     )
+    model_context_windows_json: JsonValue | None = Field(
+        default={"gpt-5": 400000, "gpt-5-nano": 400000},
+        validation_alias=AliasChoices("MODEL_CONTEXT_WINDOWS_JSON"),
+    )
     rate_limits_json: JsonValue | None = Field(
         default=None, validation_alias=AliasChoices("RATE_LIMITS_JSON")
     )
@@ -100,10 +113,29 @@ class Settings(BaseSettings):
     enable_trace_redaction: bool = Field(
         default=False, validation_alias=AliasChoices("ENABLE_TRACE_REDACTION")
     )
+    enable_root_state_summary: bool = Field(
+        default=False, validation_alias=AliasChoices("ENABLE_ROOT_STATE_SUMMARY")
+    )
+    enable_eval_judge: bool = Field(
+        default=False, validation_alias=AliasChoices("ENABLE_EVAL_JUDGE")
+    )
+    verify_s3_objects_for_readiness: bool = Field(
+        default=False, validation_alias=AliasChoices("VERIFY_S3_OBJECTS_FOR_READINESS")
+    )
+    eval_judge_model: str | None = Field(
+        default=None, validation_alias=AliasChoices("EVAL_JUDGE_MODEL")
+    )
+    eval_judge_provider: str | None = Field(
+        default=None, validation_alias=AliasChoices("EVAL_JUDGE_PROVIDER")
+    )
+    tool_resolution_max_concurrency: int = Field(
+        default=4, validation_alias=AliasChoices("TOOL_RESOLUTION_MAX_CONCURRENCY")
+    )
 
     @field_validator(
         "default_budgets_json",
         "default_models_json",
+        "model_context_windows_json",
         "rate_limits_json",
         "search_backend_config",
         mode="before",
@@ -112,7 +144,12 @@ class Settings(BaseSettings):
     def _load_json_blob(cls, value: JsonValue | str | None) -> JsonValue | None:
         return _parse_json_blob(value)
 
-    @field_validator("openai_timeout_seconds", "openai_max_retries", mode="before")
+    @field_validator(
+        "openai_timeout_seconds",
+        "openai_max_retries",
+        "sandbox_lambda_timeout_seconds",
+        mode="before",
+    )
     @classmethod
     def _load_optional_scalars(cls, value: JsonValue | str | None) -> JsonValue | None:
         return _parse_optional_scalar(value)

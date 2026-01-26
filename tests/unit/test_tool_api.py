@@ -3,9 +3,11 @@ import pytest
 from rlm_rs.models import LimitsSnapshot, ToolRequestsEnvelope
 from rlm_rs.sandbox.tool_api import (
     ToolAPI,
+    ToolAPIError,
     ToolFinal,
     ToolRequestLimitError,
     ToolYield,
+    TOOL_SCHEMA_VERSION,
 )
 
 
@@ -26,6 +28,46 @@ def test_tool_requests_envelope_normalization() -> None:
     assert llm_request.temperature == 0
     assert search_request.key == "s1"
     assert search_request.k == 10
+
+
+def test_queue_llm_accepts_max_output_chars_alias() -> None:
+    tool = ToolAPI()
+
+    tool.queue_llm("k1", "prompt", max_output_chars=64)
+
+    envelope = tool.tool_requests
+    assert envelope.llm[0].max_tokens == 64
+
+
+def test_queue_llm_accepts_max_output_tokens_alias() -> None:
+    tool = ToolAPI()
+
+    tool.queue_llm("k1", "prompt", max_output_tokens=32)
+
+    envelope = tool.tool_requests
+    assert envelope.llm[0].max_tokens == 32
+
+
+def test_queue_llm_requires_exactly_one_limit() -> None:
+    tool = ToolAPI()
+
+    with pytest.raises(ToolAPIError):
+        tool.queue_llm("k1", "prompt")
+
+    with pytest.raises(ToolAPIError):
+        tool.queue_llm("k1", "prompt", max_tokens=1, max_output_tokens=2)
+
+
+def test_tool_schema_exposes_signatures() -> None:
+    tool = ToolAPI()
+
+    schema = tool.schema()
+    assert schema["version"] == TOOL_SCHEMA_VERSION
+    assert "signature_text" in schema
+    tools = schema["tools"]
+    assert isinstance(tools, list)
+    names = {item.get("name") for item in tools if isinstance(item, dict)}
+    assert names == {"queue_llm", "queue_search", "YIELD", "FINAL"}
 
 
 def test_tool_request_limit_enforced() -> None:

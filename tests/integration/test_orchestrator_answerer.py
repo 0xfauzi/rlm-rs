@@ -1,4 +1,5 @@
 import os
+import threading
 from datetime import datetime, timezone
 from typing import Any
 
@@ -202,23 +203,23 @@ def test_orchestrator_fake_provider_completes_answerer() -> None:
 
     root_outputs = [
         """```repl
-if \"work\" not in state:
-    state[\"work\"] = {}
+if "work" not in state:
+    state["work"] = {}
 
 tool.queue_llm(
-    \"k1\",
-    \"Summarize: \" + str(len(context)),
+    "k1",
+    "Summarize: " + str(len(context)),
     max_tokens=50,
     temperature=0,
 )
-tool.YIELD(\"waiting\")
+tool.YIELD("waiting")
 ```""",
         """```repl
 snippet = context[0][0:5]
 answer = (
     snippet
-    + \" | \"
-    + state[\"_tool_results\"][\"llm\"][\"k1\"][\"text\"]
+    + " | "
+    + state["_tool_results"]["llm"]["k1"]["text"]
 )
 tool.FINAL(answer)
 ```""",
@@ -246,3 +247,182 @@ tool.FINAL(answer)
     citations = execution_item.get("citations")
     assert isinstance(citations, list)
     assert citations
+
+
+def test_code_logs_visible_while_execution_running() -> None:
+    s3_client, ddb_client, ddb_resource, bucket, prefix = _ensure_localstack_clients()
+    _ensure_bucket(s3_client, bucket)
+    tables = _ensure_tables(ddb_client, prefix)
+
+    tenant_id = "tenant-orch-code-log"
+    session_id = "sess-orch-code-log"
+    doc_id = "doc-orch-code-log"
+    execution_id = "exec-orch-code-log"
+    ttl_epoch = int(datetime(2026, 1, 2, tzinfo=timezone.utc).timestamp())
+
+    text = "Alpha beta gamma delta"
+    text_key = "parsed/tenant-orch-code-log/sess-orch-code-log/doc-orch-code-log/text.txt"
+    offsets_key = (
+        "parsed/tenant-orch-code-log/sess-orch-code-log/doc-orch-code-log/offsets.json"
+    )
+    s3.put_bytes(s3_client, bucket, text_key, text.encode("utf-8"))
+    s3.put_json(s3_client, bucket, offsets_key, _build_offsets_payload(text))
+
+    sessions_table = ddb_resource.Table(tables.sessions)
+    documents_table = ddb_resource.Table(tables.documents)
+    executions_table = ddb_resource.Table(tables.executions)
+    execution_state_table = ddb_resource.Table(tables.execution_state)
+    code_log_table = ddb_resource.Table(tables.code_log)
+
+    ddb.create_session(
+        sessions_table,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        status="READY",
+        created_at="2026-01-01T00:00:00Z",
+        expires_at="2026-01-02T00:00:00Z",
+        ttl_epoch=ttl_epoch,
+        doc_count=1,
+        options={"enable_search": False, "readiness_mode": "LAX"},
+    )
+    ddb.create_document(
+        documents_table,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        doc_id=doc_id,
+        doc_index=0,
+        source_name="sample.txt",
+        mime_type="text/plain",
+        raw_s3_uri="s3://raw/sample.txt",
+        ingest_status="PARSED",
+        text_s3_uri=f"s3://{bucket}/{text_key}",
+        offsets_s3_uri=f"s3://{bucket}/{offsets_key}",
+        char_length=len(text),
+        byte_length=len(text.encode("utf-8")),
+    )
+
+    budgets = {
+        "max_turns": 3,
+        "max_total_seconds": 60,
+        "max_llm_subcalls": 2,
+        "max_llm_prompt_chars": 12000,
+        "max_total_llm_prompt_chars": 24000,
+    }
+    models = {"root_model": "fake-root", "sub_model": "fake-sub"}
+
+    ddb.create_execution(
+        executions_table,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        execution_id=execution_id,
+        status="RUNNING",
+        mode="ANSWERER",
+        question="Summarize",
+        budgets_requested=budgets,
+        models=models,
+        started_at="2026-01-01T00:01:00Z",
+    )
+
+    state_record = state_store.persist_state_payload(
+        state={},
+        tenant_id=tenant_id,
+        execution_id=execution_id,
+        turn_index=0,
+    )
+    ddb.put_execution_state(
+        execution_state_table,
+        execution_id=execution_id,
+        turn_index=0,
+        updated_at="2026-01-01T00:01:00Z",
+        ttl_epoch=ttl_epoch,
+        state_json=state_record.state_json,
+        state_s3_uri=state_record.state_s3_uri,
+        checksum=state_record.checksum,
+        summary=state_record.summary,
+    )
+
+    root_outputs = [
+        """```repl
+if "work" not in state:
+    state["work"] = {}
+
+tool.queue_llm(
+    "k1",
+    "Summarize: " + str(len(context)),
+    max_tokens=50,
+    temperature=0,
+)
+tool.YIELD("waiting")
+```""",
+        """```repl
+answer = state["_tool_results"]["llm"]["k1"]["text"]
+tool.FINAL(answer)
+```""",
+    ]
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class _BlockingProvider:
+        def __init__(self) -> None:
+            self._outputs = list(root_outputs)
+
+        def complete_root(
+            self, prompt: str, model: str | None, *, tenant_id: str | None = None
+        ) -> str:
+            if self._outputs:
+                return self._outputs.pop(0)
+            return "```repl\\ntool.FINAL(\"ok\")\\n```"
+
+        def complete_baseline(
+            self, prompt: str, model: str | None, *, tenant_id: str | None = None
+        ) -> str:
+            return "baseline"
+
+        def complete_subcall(
+            self,
+            prompt: str,
+            model: str | None,
+            max_tokens: int,
+            temperature: float | None,
+            *,
+            tenant_id: str | None = None,
+        ) -> str:
+            started.set()
+            release.wait(timeout=5)
+            return "```repl\\nprint('sub')\\n```"
+
+    region, endpoint_url, _, _ = _localstack_config()
+    settings = _settings_with_env(
+        bucket=bucket,
+        region=region,
+        endpoint_url=endpoint_url,
+        prefix=prefix,
+    )
+
+    worker = OrchestratorWorker(
+        settings=settings,
+        ddb_resource=ddb_resource,
+        table_names=tables,
+        s3_client=s3_client,
+        provider=_BlockingProvider(),
+    )
+
+    thread = threading.Thread(target=worker.run_once, kwargs={"limit": 1})
+    thread.start()
+    assert started.wait(timeout=5)
+
+    execution_item = ddb.get_execution(
+        executions_table,
+        session_id=session_id,
+        execution_id=execution_id,
+    )
+    assert execution_item is not None
+    assert execution_item.get("status") == "RUNNING"
+
+    items, _ = ddb.list_code_log_entries(code_log_table, execution_id=execution_id)
+    assert items
+
+    release.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()

@@ -1,36 +1,49 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# RLM-RS UI
 
-## Getting Started
+Developer-facing Next.js UI for inspecting and driving RLM-RS sessions, executions, runtime steps, and citations.
 
-First, run the development server:
+## How it works
+
+- The UI calls same-origin endpoints (`/v1/*`, `/health/*`) and relies on Next.js rewrites defined in `ui/next.config.js`.
+- In dev, those rewrites proxy to:
+  - `API_PROXY_TARGET` (default `http://localhost:8080`)
+  - `LOCALSTACK_PROXY_TARGET` (default `http://localhost:4566`)
+- This keeps the UI environment-agnostic: the UI does not hardcode backend URLs in fetch calls.
+
+## Quick start
+
+From the repo root:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+docker compose up --build
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Then open `http://localhost:3000`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Local UI development
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+From `ui/`:
 
-## Learn More
+```bash
+npm ci
+npm run dev
+```
 
-To learn more about Next.js, take a look at the following resources:
+The UI expects the backend stack to be reachable via the proxy targets above. The easiest way is to start the full stack with `docker compose up --build` from the repo root.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Tests and quality checks
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+From `ui/`:
 
-## Deploy on Vercel
+- Lint: `npm run lint`
+- Typecheck: `npm run typecheck`
+- Unit tests (Vitest): `npm test`
+- E2E tests (Playwright): `npm run test:e2e`
+- Production build: `npm run build`
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Common gotchas
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Pages that call `useSearchParams` must wrap the consuming client component in a `Suspense` boundary to avoid prerender/build errors (repo-wide invariant).
+- Keep secrets out of the browser: provider keys belong in the orchestrator/API processes, not in the UI.
+
+For more UI-specific guidance, see `ui/AGENTS.md`.

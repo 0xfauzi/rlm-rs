@@ -1,3 +1,7 @@
+# Runtime mode sequence (client-driven)
+
+This diagram shows Runtime mode, where the client submits each step and optionally asks the service to resolve tools. For the managed orchestrator loop, see `docs/sequence.md`.
+
 ```mermaid
 sequenceDiagram
   autonumber
@@ -45,7 +49,7 @@ sequenceDiagram
       API-->>Client: 200 {status=COMPLETED, answer, citations, trace_s3_uri}
     else error returned
       API-->>Client: 200 {success=false, error, stdout, state, span_log}
-      Note over Client: Client decides whether to retry, modify code, or abort.
+      Note over Client: Client decides whether to retry, modify code, or cancel.
     else no final
       API-->>Client: 200 {success=true, stdout, state, span_log, tool_requests}
     end

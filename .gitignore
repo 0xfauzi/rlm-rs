@@ -88,3 +88,11 @@ site/
 *.db
 *.sqlite
 *.sqlite3
+
+# Allow directory-local agent guides in ignored dirs
+!**/__pycache__/
+**/__pycache__/**
+!**/__pycache__/AGENTS.md
+!**/*.egg-info/
+**/*.egg-info/**
+!**/*.egg-info/AGENTS.md

@@ -958,6 +958,195 @@
       "priority": 57,
       "passes": true,
       "notes": ""
+    },
+    {
+      "id": "US-058",
+      "title": "Add evaluation storage table and models",
+      "acceptanceCriteria": [
+        "src/rlm_rs/storage/ddb.py adds evaluations to DdbTableNames and build_table_names.",
+        "src/rlm_rs/storage/ddb.py defines evaluation key helpers and create/get helpers for evaluation records.",
+        "scripts/localstack_init.sh creates rlm_evaluations table (respects DDB_TABLE_PREFIX).",
+        "src/rlm_rs/models.py adds EvaluationBaselineStatus and EvaluationRecord with fields: evaluation_id, tenant_id, session_id, execution_id, mode, question, answer, baseline_status, baseline_skip_reason, baseline_answer, baseline_input_tokens, baseline_context_window, created_at.",
+        "Existing DdbTableNames test fixtures updated to include evaluations table name.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q tests/unit -k evaluation exits 0."
+      ],
+      "priority": 58,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-059",
+      "title": "Build full-document baseline prompt and fit check",
+      "acceptanceCriteria": [
+        "Baseline logic only runs for ExecutionMode.ANSWERER; runtime executions are skipped with baseline_skip_reason set to RUNTIME_MODE.",
+        "Baseline prompt concatenates all parsed text in doc_index order from text_s3_uri, joined with \\n\\n, with no normalization or trimming.",
+        "src/rlm_rs/settings.py adds MODEL_CONTEXT_WINDOWS_JSON with defaults for gpt-5=400000 and gpt-5-nano=400000; .env.example and compose.yaml updated per env var checklist.",
+        "Fit check uses OpenAI Responses input_tokens for the baseline prompt and model, no local estimation.",
+        "If model context window is unknown or token count exceeds the window, baseline is skipped with baseline_skip_reason set to UNKNOWN_CONTEXT_WINDOW or CONTEXT_WINDOW_EXCEEDED.",
+        "If any document lacks parsed text (non-PARSED or missing text_s3_uri), baseline is skipped with baseline_skip_reason set to MISSING_PARSED_TEXT.",
+        "Tests cover fit check branches and deterministic concatenation: uv run pytest -q tests/unit -k baseline exits 0."
+      ],
+      "priority": 59,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-060",
+      "title": "Create baseline evaluation per answerer execution",
+      "acceptanceCriteria": [
+        "Orchestrator triggers baseline evaluation after answerer execution completes with status COMPLETED.",
+        "Baseline run uses the same model config and question as the execution and bypasses sandbox and retrieval.",
+        "Evaluation record is persisted in rlm_evaluations with execution_id, session_id, tenant_id, mode, question, answer, baseline_answer, baseline_status, baseline_skip_reason, baseline_input_tokens, baseline_context_window, created_at.",
+        "If baseline is skipped, evaluation record is still created with baseline_answer null and baseline_status SKIPPED.",
+        "Runtime executions do not create evaluation records.",
+        "Integration test verifies evaluation creation for ANSWERER and no record for RUNTIME: uv run pytest -q tests/integration -k evaluation exits 0."
+      ],
+      "priority": 60,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-061",
+      "title": "Expose evaluation record via API",
+      "acceptanceCriteria": [
+        "src/rlm_rs/api/executions.py adds GET /v1/executions/{execution_id}/evaluation endpoint.",
+        "Response body includes evaluation record fields and uses a dedicated response model in src/rlm_rs/models.py.",
+        "Endpoint enforces tenant isolation and returns 404 when no evaluation exists.",
+        "Endpoint returns VALIDATION_ERROR when execution mode is RUNTIME, or returns 404 if not applicable, with behavior documented in tests.",
+        "Tests cover 200, 404, and cross-tenant access: uv run pytest -q tests/unit -k evaluation_api exits 0."
+      ],
+      "priority": 61,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-062",
+      "title": "Add LLM judge evaluation using Ragas",
+      "acceptanceCriteria": [
+        "Dependencies add ragas via uv add ragas and update uv.lock.",
+        "src/rlm_rs/settings.py adds EVAL_JUDGE_MODEL and EVAL_JUDGE_PROVIDER (or equivalent) with .env.example and compose.yaml updates.",
+        "Judge pipeline uses Ragas metrics answer_relevancy and faithfulness to score both answerer and baseline answers.",
+        "Judge inputs use question, answer, and contexts: answerer contexts derive from citation spans, baseline contexts use the concatenated full-document text.",
+        "Evaluation record stores judge metrics in a structured field with separate entries for answerer and baseline scores.",
+        "Judge run is gated behind ENABLE_EVAL_JUDGE=true and defaults to disabled.",
+        "Tests mock judge execution and verify persistence: uv run pytest -q tests/unit -k eval_judge exits 0."
+      ],
+      "priority": 62,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-063",
+      "title": "Show baseline answer alongside execution answer in UI",
+      "acceptanceCriteria": [
+        "ui/src/lib/types.ts adds an EvaluationRecord type that matches GET /v1/executions/{execution_id}/evaluation response fields, including baseline_status, baseline_skip_reason, baseline_answer, baseline_input_tokens, baseline_context_window, and judge_metrics.",
+        "ui/src/lib/api-client.ts adds getExecutionEvaluation(executionId) calling /v1/executions/{execution_id}/evaluation.",
+        "ui/src/app/executions/[execution_id]/page.tsx fetches evaluation when execution mode is ANSWERER and renders a Baseline section next to Answer on desktop and stacked on mobile.",
+        "Baseline section displays status badge, skip reason when status is SKIPPED, input tokens and context window values, and the baseline answer text when available.",
+        "If the evaluation endpoint returns 404, Baseline section shows EmptyState with Not available yet message; if mode is RUNTIME, Baseline section shows Not supported message.",
+        "Loading state uses SkeletonCard; non-404 errors show ErrorPanel.",
+        "npm run typecheck --prefix ui exits 0.",
+        "npm run lint --prefix ui exits 0."
+      ],
+      "priority": 63,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-064",
+      "title": "Show LLM judge results in UI",
+      "acceptanceCriteria": [
+        "ui/src/app/executions/[execution_id]/page.tsx adds an Evaluation section that renders judge_metrics when present.",
+        "Evaluation section shows a metric table with rows for answer_relevancy and faithfulness and columns for Answerer and Baseline values.",
+        "Metrics are formatted to two decimal places and show '-' when missing.",
+        "If judge_metrics is missing, Evaluation section shows EmptyState with Evaluation not run message.",
+        "Evaluation section remains hidden for runtime executions.",
+        "npm run typecheck --prefix ui exits 0.",
+        "npm run lint --prefix ui exits 0."
+      ],
+      "priority": 64,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-065",
+      "title": "Add evaluation running status and UI progress",
+      "acceptanceCriteria": [
+        "src/rlm_rs/models.py allows EvaluationBaselineStatus to be RUNNING.",
+        "src/rlm_rs/orchestrator/worker.py seeds an evaluation record with baseline_status RUNNING before baseline and judge work begins, using the same execution_id.",
+        "src/rlm_rs/storage/ddb.py adds update_evaluation and worker uses it to persist baseline_status, skip reason, baseline answer, token counts, context window, and judge_metrics at completion.",
+        "GET /v1/executions/{execution_id}/evaluation returns baseline_status RUNNING immediately after execution completion instead of 404 when evaluation is in progress.",
+        "ui/src/app/executions/[execution_id]/page.tsx polls for evaluation while baseline_status is RUNNING and renders a visible Evaluation running state for both Baseline and Evaluation panels.",
+        "UI no longer surfaces Evaluation not found errors while evaluation is running.",
+        "uv run pytest -q tests/unit -k evaluation exits 0.",
+        "npm run typecheck --prefix ui exits 0."
+      ],
+      "priority": 65,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-066",
+      "title": "Allow baseline eval when docs are indexed",
+      "acceptanceCriteria": [
+        "src/rlm_rs/orchestrator/baseline.py treats ingest_status INDEXING and INDEXED as parsed-ready when text_s3_uri is present.",
+        "Baseline skip reason MISSING_PARSED_TEXT is only used when a document lacks parsed text or text_s3_uri.",
+        "tests/unit/test_baseline.py adds coverage for INDEXED status and passes: uv run pytest -q tests/unit -k baseline exits 0."
+      ],
+      "priority": 66,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-067",
+      "title": "Make baseline token counting compatible with chat completions",
+      "acceptanceCriteria": [
+        "src/rlm_rs/orchestrator/baseline.py counts input tokens via chat.completions usage.prompt_tokens with max_tokens or max_completion_tokens as required.",
+        "If chat.completions token counting fails, baseline falls back to responses input_tokens.",
+        "Context window errors during token counting return CONTEXT_WINDOW_EXCEEDED instead of BASELINE_ERROR.",
+        "tests/unit/test_baseline.py fakes chat completions usage and passes: uv run pytest -q tests/unit -k baseline exits 0."
+      ],
+      "priority": 67,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-068",
+      "title": "Log and display root, sub, and tool code during execution",
+      "acceptanceCriteria": [
+        "src/rlm_rs/models.py defines CodeLogEntry and CodeLogResponse models with fields for execution_id, sequence, created_at, source (ROOT, SUB, TOOL), kind (REPL, TOOL_REQUEST, TOOL_RESULT), model_name, tool_type, and content.",
+        "Root and sub-model outputs extract the single ```repl``` fenced block content and append it as REPL entries without fences, preserving the code text as-is.",
+        "Tool requests and tool results are logged as TOOL_REQUEST and TOOL_RESULT entries with tool_type and payload content.",
+        "Code log entries are persisted in DynamoDB with ordering by execution_id and sequence, and scripts/localstack_init.sh creates the code log table using the DDB_TABLE_PREFIX.",
+        "Structured logs emit a code_log event with the same fields stored in DynamoDB.",
+        "When enable_trace_redaction is true, redaction applies to code log content and tool payloads before persistence to DynamoDB or logs.",
+        "GET /v1/executions/{execution_id}/code returns CodeLogResponse entries ordered by sequence with cursor-based pagination.",
+        "Execution detail UI adds a Code panel that displays repl code blocks and tool calls rendered as formatted JSON, with filters for root, sub, and tool entries.",
+        "Code panel updates during RUNNING or PENDING executions by polling the code log endpoint for new entries.",
+        "Unit tests cover repl extraction, tool call logging, redaction behavior, and code log ordering; integration test verifies code log entries are visible while execution is running.",
+        "Typecheck passes: uv run ruff check . exits 0.",
+        "Tests pass: uv run pytest -q exits 0."
+      ],
+      "priority": 68,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-069",
+      "title": "Render execution code blocks with preserved formatting",
+      "acceptanceCriteria": [
+        "Execution detail Code panel renders repl entries using a dedicated CodeBlock component in the UI.",
+        "CodeBlock renders content in <pre><code> with a monospace font and preserves whitespace and indentation using white-space: pre.",
+        "CodeBlock renders code as plain text with no trimming or normalization of leading, trailing, or blank lines.",
+        "Long lines are not truncated with ellipses and remain accessible via scrolling or wrapping without altering whitespace.",
+        "UI test renders a repl sample with indentation, blank lines, and tabs and asserts rendered textContent equals the input string.",
+        "npm run typecheck --prefix ui exits 0.",
+        "npm run lint --prefix ui exits 0."
+      ],
+      "priority": 69,
+      "passes": true,
+      "notes": ""
     }
   ]
 }

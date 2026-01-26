@@ -8,6 +8,7 @@ from structlog.stdlib import BoundLogger
 
 from rlm_rs.logging import get_logger as _get_logger
 from rlm_rs.settings import Settings
+from rlm_rs.sandbox.runner import SandboxRunner, build_sandbox_runner
 from rlm_rs.storage.ddb import (
     DdbTableNames,
     build_ddb_client,
@@ -53,6 +54,12 @@ def get_ddb_resource() -> ServiceResource:
 def get_table_names() -> DdbTableNames:
     settings = get_settings()
     return build_table_names(settings.ddb_table_prefix)
+
+
+@lru_cache
+def get_sandbox_runner() -> SandboxRunner:
+    settings = get_settings()
+    return build_sandbox_runner(settings, logger=_get_logger("rlm_rs.sandbox.runner"))
 
 
 def get_logger() -> BoundLogger:

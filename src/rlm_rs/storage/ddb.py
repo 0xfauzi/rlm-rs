@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
+from typing import Any, Mapping
 
 import boto3
 from boto3.dynamodb.conditions import Key
@@ -21,6 +21,11 @@ EXECUTION_SK_PREFIX = "EXEC#"
 EXECUTION_STATE_PK_PREFIX = "EXEC#"
 EXECUTION_STATE_SK = "STATE"
 EXECUTION_STATE_STEP_SK_PREFIX = "STATE#"
+EVALUATION_PK_PREFIX = "EXEC#"
+EVALUATION_SK = "EVAL"
+CODE_LOG_PK_PREFIX = "EXEC#"
+CODE_LOG_SK_PREFIX = "CODE#"
+CODE_LOG_SEQUENCE_WIDTH = 20
 
 
 @dataclass(frozen=True)
@@ -29,6 +34,8 @@ class DdbTableNames:
     documents: str
     executions: str
     execution_state: str
+    evaluations: str
+    code_log: str
     api_keys: str
     audit_log: str
 
@@ -43,6 +50,8 @@ def build_table_names(prefix: str | None) -> DdbTableNames:
         documents=table_name(prefix, "documents"),
         executions=table_name(prefix, "executions"),
         execution_state=table_name(prefix, "execution_state"),
+        evaluations=table_name(prefix, "evaluations"),
+        code_log=table_name(prefix, "code_log"),
         api_keys=table_name(prefix, "api_keys"),
         audit_log=table_name(prefix, "audit_log"),
     )
@@ -107,6 +116,17 @@ def execution_state_step_key(execution_id: str, turn_index: int) -> dict[str, st
     return {
         "PK": f"{EXECUTION_STATE_PK_PREFIX}{execution_id}",
         "SK": f"{EXECUTION_STATE_STEP_SK_PREFIX}{turn_index}",
+    }
+
+
+def evaluation_key(execution_id: str) -> dict[str, str]:
+    return {"PK": f"{EVALUATION_PK_PREFIX}{execution_id}", "SK": EVALUATION_SK}
+
+
+def code_log_key(execution_id: str, sequence: int) -> dict[str, str]:
+    return {
+        "PK": f"{CODE_LOG_PK_PREFIX}{execution_id}",
+        "SK": f"{CODE_LOG_SK_PREFIX}{sequence:0{CODE_LOG_SEQUENCE_WIDTH}d}",
     }
 
 
@@ -436,6 +456,182 @@ def update_execution_status(
     return True
 
 
+def create_evaluation(
+    table: Any,
+    *,
+    evaluation_id: str,
+    tenant_id: str,
+    session_id: str,
+    execution_id: str,
+    mode: str,
+    question: str,
+    answer: str | None = None,
+    baseline_status: str,
+    baseline_skip_reason: str | None = None,
+    baseline_answer: str | None = None,
+    baseline_input_tokens: int | None = None,
+    baseline_context_window: int | None = None,
+    judge_metrics: dict[str, JsonValue] | None = None,
+    created_at: str,
+) -> dict[str, Any]:
+    item = _without_none(
+        {
+            **evaluation_key(execution_id),
+            "evaluation_id": evaluation_id,
+            "tenant_id": tenant_id,
+            "session_id": session_id,
+            "execution_id": execution_id,
+            "mode": mode,
+            "question": question,
+            "answer": answer,
+            "baseline_status": baseline_status,
+            "baseline_skip_reason": baseline_skip_reason,
+            "baseline_answer": baseline_answer,
+            "baseline_input_tokens": baseline_input_tokens,
+            "baseline_context_window": baseline_context_window,
+            "judge_metrics": judge_metrics,
+            "created_at": created_at,
+        }
+    )
+    item["baseline_answer"] = baseline_answer
+    item["baseline_input_tokens"] = baseline_input_tokens
+    item["baseline_context_window"] = baseline_context_window
+    coerced = _coerce_decimals(item)
+    table.put_item(Item=coerced, ConditionExpression="attribute_not_exists(PK)")
+    return coerced
+
+
+def update_evaluation(
+    table: Any,
+    *,
+    execution_id: str,
+    baseline_status: str,
+    baseline_skip_reason: str | None = None,
+    baseline_answer: str | None = None,
+    baseline_input_tokens: int | None = None,
+    baseline_context_window: int | None = None,
+    judge_metrics: dict[str, JsonValue] | None = None,
+) -> bool:
+    updates = ["baseline_status = :baseline_status"]
+    values: dict[str, Any] = {":baseline_status": baseline_status}
+    if baseline_skip_reason is not None:
+        updates.append("baseline_skip_reason = :baseline_skip_reason")
+        values[":baseline_skip_reason"] = baseline_skip_reason
+    if baseline_answer is not None:
+        updates.append("baseline_answer = :baseline_answer")
+        values[":baseline_answer"] = baseline_answer
+    if baseline_input_tokens is not None:
+        updates.append("baseline_input_tokens = :baseline_input_tokens")
+        values[":baseline_input_tokens"] = baseline_input_tokens
+    if baseline_context_window is not None:
+        updates.append("baseline_context_window = :baseline_context_window")
+        values[":baseline_context_window"] = baseline_context_window
+    if judge_metrics is not None:
+        updates.append("judge_metrics = :judge_metrics")
+        values[":judge_metrics"] = judge_metrics
+
+    try:
+        table.update_item(
+            Key=evaluation_key(execution_id),
+            UpdateExpression=f"SET {', '.join(updates)}",
+            ExpressionAttributeValues=_coerce_decimals(values),
+            ConditionExpression="attribute_exists(PK)",
+        )
+    except ClientError as err:
+        if _conditional_failed(err):
+            return False
+        raise
+    return True
+
+
+def get_evaluation(table: Any, *, execution_id: str) -> dict[str, Any] | None:
+    response = table.get_item(Key=evaluation_key(execution_id))
+    return response.get("Item")
+
+
+def _parse_code_log_sequence(item: Mapping[str, Any]) -> int:
+    raw = item.get("sequence")
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    if isinstance(raw, Decimal):
+        return int(raw)
+    sk = str(item.get("SK", ""))
+    if sk.startswith(CODE_LOG_SK_PREFIX):
+        suffix = sk.removeprefix(CODE_LOG_SK_PREFIX)
+        if suffix.isdigit():
+            return int(suffix)
+    return 0
+
+
+def next_code_log_sequence(
+    table: Any,
+    *,
+    execution_id: str,
+    count: int = 1,
+) -> int:
+    pk = f"{CODE_LOG_PK_PREFIX}{execution_id}"
+    response = table.query(KeyConditionExpression=Key("PK").eq(pk))
+    items = list(response.get("Items", []))
+    while response.get("LastEvaluatedKey"):
+        response = table.query(
+            KeyConditionExpression=Key("PK").eq(pk),
+            ExclusiveStartKey=response["LastEvaluatedKey"],
+        )
+        items.extend(response.get("Items", []))
+    max_seq = 0
+    for item in items:
+        sk = str(item.get("SK", ""))
+        if not sk.startswith(CODE_LOG_SK_PREFIX):
+            continue
+        max_seq = max(max_seq, _parse_code_log_sequence(item))
+    return max_seq + 1
+
+
+def put_code_log_entries(
+    table: Any,
+    *,
+    execution_id: str,
+    entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not entries:
+        return []
+    start_seq = next_code_log_sequence(table, execution_id=execution_id, count=len(entries))
+    items: list[dict[str, Any]] = []
+    for offset, entry in enumerate(entries):
+        sequence = start_seq + offset
+        item = _without_none(
+            {
+                **code_log_key(execution_id, sequence),
+                "execution_id": execution_id,
+                "sequence": sequence,
+                **entry,
+            }
+        )
+        table.put_item(Item=_coerce_decimals(item), ConditionExpression="attribute_not_exists(PK)")
+        items.append(item)
+    return items
+
+
+def list_code_log_entries(
+    table: Any,
+    *,
+    execution_id: str,
+    limit: int | None = None,
+    exclusive_start_key: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    key_condition = Key("PK").eq(f"{CODE_LOG_PK_PREFIX}{execution_id}") & Key("SK").begins_with(
+        CODE_LOG_SK_PREFIX
+    )
+    kwargs: dict[str, Any] = {"KeyConditionExpression": key_condition}
+    if exclusive_start_key is not None:
+        kwargs["ExclusiveStartKey"] = exclusive_start_key
+    if limit is not None:
+        kwargs["Limit"] = limit
+    response = table.query(**kwargs)
+    items = list(response.get("Items", []))
+    return items, response.get("LastEvaluatedKey")
+
+
 def put_execution_state(
     table: Any,
     *,
@@ -447,6 +643,7 @@ def put_execution_state(
     state_s3_uri: str | None = None,
     checksum: str | None = None,
     summary: dict[str, JsonValue] | None = None,
+    timings: dict[str, JsonValue] | None = None,
     success: bool | None = None,
     stdout: str | None = None,
     span_log: list[dict[str, JsonValue]] | None = None,
@@ -465,6 +662,7 @@ def put_execution_state(
             "state_s3_uri": state_s3_uri,
             "checksum": checksum,
             "summary": summary,
+            "timings": timings,
             "success": success,
             "stdout": stdout,
             "span_log": span_log,
@@ -488,6 +686,7 @@ def put_execution_state_step(
     state_s3_uri: str | None = None,
     checksum: str | None = None,
     summary: dict[str, JsonValue] | None = None,
+    timings: dict[str, JsonValue] | None = None,
     success: bool | None = None,
     stdout: str | None = None,
     span_log: list[dict[str, JsonValue]] | None = None,
@@ -506,6 +705,7 @@ def put_execution_state_step(
             "state_s3_uri": state_s3_uri,
             "checksum": checksum,
             "summary": summary,
+            "timings": timings,
             "success": success,
             "stdout": stdout,
             "span_log": span_log,

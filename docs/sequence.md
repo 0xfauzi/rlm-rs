@@ -1,4 +1,7 @@
-## Sequence
+# Answerer mode sequence (managed)
+
+This diagram shows the end-to-end Answerer mode loop where the orchestrator drives execution. For client-driven stepping, see `docs/runtime_sequence.md`.
+
 ```mermaid
 sequenceDiagram
   autonumber
@@ -99,4 +102,4 @@ sequenceDiagram
   Client->>API: GET /v1/executions/{execution_id}
   API->>DDB: Read execution summary
   API-->>Client: 200 {status, answer, citations(SpanRefs), trace_s3_uri}
-  ```
+```

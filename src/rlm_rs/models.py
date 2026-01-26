@@ -22,6 +22,14 @@ ExecutionStatus: TypeAlias = Literal[
 ]
 ExecutionMode: TypeAlias = Literal["ANSWERER", "RUNTIME"]
 ToolRequestStatus: TypeAlias = Literal["pending", "resolved", "error"]
+EvaluationBaselineStatus: TypeAlias = Literal["COMPLETED", "SKIPPED", "RUNNING"]
+CodeLogSource: TypeAlias = Literal["ROOT", "SUB", "TOOL"]
+CodeLogKind: TypeAlias = Literal[
+    "REPL",
+    "REPL_PARSE_ERROR",
+    "TOOL_REQUEST",
+    "TOOL_RESULT",
+]
 
 
 class RLMBaseModel(BaseModel):
@@ -136,6 +144,7 @@ class GetSessionResponse(RLMBaseModel):
     status: SessionStatus
     created_at: str
     expires_at: str
+    budgets_default: Budgets | None = None
     readiness: SessionReadiness
     docs: list[SessionDocumentStatus]
 
@@ -187,6 +196,7 @@ class ExecutionStatusResponse(RLMBaseModel):
     execution_id: str
     mode: ExecutionMode | None = None
     status: ExecutionStatus
+    question: str | None = None
     answer: str | None = None
     citations: list[SpanRef] | None = None
     budgets_requested: Budgets | None = None
@@ -213,6 +223,55 @@ class ExecutionListItem(RLMBaseModel):
 class ListExecutionsResponse(RLMBaseModel):
     executions: list[ExecutionListItem]
     next_cursor: str | None = None
+
+
+class EvaluationJudgeScores(RLMBaseModel):
+    answer_relevancy: float | None = None
+    faithfulness: float | None = None
+    faithfulness_skip_reason: str | None = None
+
+
+class EvaluationJudgeMetrics(RLMBaseModel):
+    answerer: EvaluationJudgeScores | None = None
+    baseline: EvaluationJudgeScores | None = None
+
+
+class EvaluationRecord(RLMBaseModel):
+    evaluation_id: str
+    tenant_id: str
+    session_id: str
+    execution_id: str
+    mode: ExecutionMode
+    question: str
+    answer: str | None = None
+    baseline_status: EvaluationBaselineStatus
+    baseline_skip_reason: str | None = None
+    baseline_answer: str | None = None
+    baseline_input_tokens: int | None = None
+    baseline_context_window: int | None = None
+    judge_metrics: EvaluationJudgeMetrics | None = None
+    created_at: str
+
+
+class ExecutionEvaluationResponse(RLMBaseModel):
+    evaluation_id: str
+    tenant_id: str
+    session_id: str
+    execution_id: str
+    mode: ExecutionMode
+    question: str
+    answer: str | None = None
+    baseline_status: EvaluationBaselineStatus
+    baseline_skip_reason: str | None = None
+    baseline_answer: str | None = None
+    baseline_input_tokens: int | None = None
+    baseline_context_window: int | None = None
+    judge_metrics: EvaluationJudgeMetrics | None = None
+    created_at: str
+
+
+class RecomputeEvaluationRequest(RLMBaseModel):
+    recompute_baseline: bool = False
 
 
 class ExecutionWaitRequest(RLMBaseModel):
@@ -316,10 +375,27 @@ class ExecutionStepSnapshot(RLMBaseModel):
     error: StepError | None = None
     checksum: str | None = None
     summary: dict[str, JsonValue] | None = None
+    timings: dict[str, JsonValue] | None = None
 
 
 class ExecutionStepHistoryResponse(RLMBaseModel):
     steps: list[ExecutionStepSnapshot]
+
+
+class CodeLogEntry(RLMBaseModel):
+    execution_id: str
+    sequence: int
+    created_at: str
+    source: CodeLogSource
+    kind: CodeLogKind
+    model_name: str | None = None
+    tool_type: str | None = None
+    content: JsonValue
+
+
+class CodeLogResponse(RLMBaseModel):
+    entries: list[CodeLogEntry]
+    next_cursor: str | None = None
 
 
 class ContextDocument(RLMBaseModel):

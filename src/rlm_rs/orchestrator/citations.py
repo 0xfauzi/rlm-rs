@@ -128,7 +128,10 @@ def make_spanrefs(
     merge_gap_chars: int | None = None,
 ) -> list[SpanRef]:
     doc_lookup = {doc.doc_index: doc for doc in documents}
-    merged_spans = merge_span_log(span_log, merge_gap_chars=merge_gap_chars)
+    filtered = [
+        span for span in span_log if not (span.tag or "").startswith("scan:")
+    ]
+    merged_spans = merge_span_log(filtered, merge_gap_chars=merge_gap_chars)
 
     span_refs: list[SpanRef] = []
     for span in merged_spans:

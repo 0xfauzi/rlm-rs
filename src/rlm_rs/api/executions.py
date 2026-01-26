@@ -15,11 +15,13 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import JsonValue
 from structlog.stdlib import BoundLogger
 
+from rlm_rs import code_log
 from rlm_rs.api.auth import ApiKeyContext, ensure_tenant_access, require_api_key
 from rlm_rs.api.dependencies import (
     get_ddb_resource,
     get_logger,
     get_s3_client,
+    get_sandbox_runner,
     get_settings,
     get_table_names,
 )
@@ -29,6 +31,8 @@ from rlm_rs.api.sessions import _query_documents as _query_session_documents
 from rlm_rs.errors import ErrorCode, raise_http_error
 from rlm_rs.models import (
     Budgets,
+    CodeLogEntry,
+    CodeLogResponse,
     ContextDocument,
     ContextManifest,
     CreateExecutionRequest,
@@ -37,6 +41,7 @@ from rlm_rs.models import (
     ExecutionOptions,
     ExecutionStepHistoryResponse,
     ExecutionStepSnapshot,
+    ExecutionEvaluationResponse,
     ExecutionStatus,
     ExecutionStatusResponse,
     ExecutionWaitRequest,
@@ -45,6 +50,7 @@ from rlm_rs.models import (
     ListExecutionsResponse,
     LLMToolResult,
     ModelsConfig,
+    RecomputeEvaluationRequest,
     SearchToolResult,
     SessionOptions,
     StepEvent,
@@ -57,7 +63,10 @@ from rlm_rs.models import (
 )
 from rlm_rs.search import search_disabled_error_meta
 from rlm_rs.settings import Settings
-from rlm_rs.sandbox.step_executor import execute_step
+from rlm_rs.sandbox.runner import SandboxRunner
+from rlm_rs.sandbox.tool_api import build_tool_schema
+from rlm_rs.orchestrator.providers import FakeLLMProvider
+from rlm_rs.orchestrator.worker import OrchestratorWorker
 from rlm_rs.storage import ddb, s3, state as state_store
 from rlm_rs.storage.ddb import DdbTableNames
 
@@ -236,7 +245,7 @@ def _merge_reserved_state(
     reserved: dict[str, JsonValue],
 ) -> dict[str, JsonValue]:
     merged = dict(state)
-    for key in ("_tool_results", "_tool_status", "_budgets", "_trace"):
+    for key in ("_tool_results", "_tool_status", "_tool_schema", "_budgets", "_trace"):
         if key in reserved:
             merged[key] = reserved[key]
     return merged
@@ -390,6 +399,7 @@ def _build_execution_response(item: Mapping[str, Any]) -> ExecutionStatusRespons
         execution_id=str(item["execution_id"]),
         mode=item.get("mode"),
         status=str(item["status"]),
+        question=item.get("question"),
         answer=item.get("answer"),
         citations=item.get("citations"),
         budgets_requested=item.get("budgets_requested"),
@@ -397,6 +407,25 @@ def _build_execution_response(item: Mapping[str, Any]) -> ExecutionStatusRespons
         started_at=item.get("started_at"),
         completed_at=item.get("completed_at"),
         trace_s3_uri=item.get("trace_s3_uri") if return_trace else None,
+    )
+
+
+def _build_evaluation_response(item: Mapping[str, Any]) -> ExecutionEvaluationResponse:
+    return ExecutionEvaluationResponse(
+        evaluation_id=str(item["evaluation_id"]),
+        tenant_id=str(item["tenant_id"]),
+        session_id=str(item["session_id"]),
+        execution_id=str(item["execution_id"]),
+        mode=str(item["mode"]),
+        question=str(item["question"]),
+        answer=item.get("answer"),
+        baseline_status=str(item["baseline_status"]),
+        baseline_skip_reason=item.get("baseline_skip_reason"),
+        baseline_answer=item.get("baseline_answer"),
+        baseline_input_tokens=item.get("baseline_input_tokens"),
+        baseline_context_window=item.get("baseline_context_window"),
+        judge_metrics=item.get("judge_metrics"),
+        created_at=str(item["created_at"]),
     )
 
 
@@ -451,6 +480,7 @@ def create_execution(
     request: CreateExecutionRequest,
     context: ApiKeyContext = Depends(require_api_key),
     settings: Settings = Depends(get_settings),
+    s3_client: BaseClient = Depends(get_s3_client),
     ddb_resource: ServiceResource = Depends(get_ddb_resource),
     table_names: DdbTableNames = Depends(get_table_names),
     logger: BoundLogger = Depends(get_logger),
@@ -481,6 +511,8 @@ def create_execution(
         document_items,
         options.readiness_mode,
         options.enable_search,
+        s3_client=s3_client,
+        verify_s3_objects=settings.verify_s3_objects_for_readiness,
     )
     if not readiness.ready:
         raise_http_error(ErrorCode.SESSION_NOT_READY, "Session not ready")
@@ -558,6 +590,170 @@ def get_execution(
     )
 
     return _build_execution_response(item)
+
+
+@router.get(
+    "/executions/{execution_id}/evaluation",
+    response_model=ExecutionEvaluationResponse,
+)
+def get_execution_evaluation(
+    execution_id: str,
+    context: ApiKeyContext = Depends(require_api_key),
+    ddb_resource: ServiceResource = Depends(get_ddb_resource),
+    table_names: DdbTableNames = Depends(get_table_names),
+    logger: BoundLogger = Depends(get_logger),
+) -> ExecutionEvaluationResponse:
+    executions_table = ddb_resource.Table(table_names.executions)
+    execution_item = _get_execution_for_tenant(
+        executions_table, execution_id, context.tenant_id
+    )
+    ensure_tenant_access(execution_item, context.tenant_id)
+
+    mode = execution_item.get("mode")
+    if mode == "RUNTIME":
+        raise_http_error(
+            ErrorCode.VALIDATION_ERROR,
+            "Evaluation is not available for runtime executions",
+        )
+
+    evaluations_table = ddb_resource.Table(table_names.evaluations)
+    evaluation_item = ddb.get_evaluation(evaluations_table, execution_id=execution_id)
+    if evaluation_item is None:
+        raise_http_error(ErrorCode.EXECUTION_NOT_FOUND, "Evaluation not found")
+    ensure_tenant_access(evaluation_item, context.tenant_id)
+
+    logger.info(
+        "executions.evaluation",
+        tenant_id=context.tenant_id,
+        session_id=execution_item.get("session_id"),
+        execution_id=execution_id,
+        status=evaluation_item.get("baseline_status"),
+    )
+
+    return _build_evaluation_response(evaluation_item)
+
+
+@router.post(
+    "/executions/{execution_id}/evaluation/recompute",
+    response_model=ExecutionEvaluationResponse,
+)
+def recompute_execution_evaluation(
+    execution_id: str,
+    request: RecomputeEvaluationRequest,
+    context: ApiKeyContext = Depends(require_api_key),
+    settings: Settings = Depends(get_settings),
+    ddb_resource: ServiceResource = Depends(get_ddb_resource),
+    s3_client: BaseClient = Depends(get_s3_client),
+    table_names: DdbTableNames = Depends(get_table_names),
+    logger: BoundLogger = Depends(get_logger),
+) -> ExecutionEvaluationResponse:
+    executions_table = ddb_resource.Table(table_names.executions)
+    execution_item = _get_execution_for_tenant(executions_table, execution_id, context.tenant_id)
+    ensure_tenant_access(execution_item, context.tenant_id)
+
+    mode = execution_item.get("mode")
+    if mode == "RUNTIME":
+        raise_http_error(
+            ErrorCode.VALIDATION_ERROR,
+            "Evaluation is not available for runtime executions",
+        )
+    status = str(execution_item.get("status") or "")
+    if status != "COMPLETED":
+        raise_http_error(
+            ErrorCode.VALIDATION_ERROR,
+            "Evaluation can only be recomputed for completed executions",
+        )
+
+    if request.recompute_baseline:
+        raise_http_error(
+            ErrorCode.VALIDATION_ERROR,
+            "Baseline recomputation is not supported from the API",
+        )
+
+    worker = OrchestratorWorker(
+        settings=settings,
+        ddb_resource=ddb_resource,
+        table_names=table_names,
+        s3_client=s3_client,
+        provider=FakeLLMProvider(),
+        logger=logger,
+    )
+    ok = worker.recompute_evaluation(
+        execution_id=execution_id,
+        tenant_id=context.tenant_id,
+        recompute_baseline=False,
+    )
+    if not ok:
+        raise_http_error(ErrorCode.EXECUTION_NOT_FOUND, "Evaluation not found")
+
+    evaluations_table = ddb_resource.Table(table_names.evaluations)
+    evaluation_item = ddb.get_evaluation(evaluations_table, execution_id=execution_id)
+    if evaluation_item is None:
+        raise_http_error(ErrorCode.EXECUTION_NOT_FOUND, "Evaluation not found")
+    ensure_tenant_access(evaluation_item, context.tenant_id)
+
+    logger.info(
+        "executions.evaluation_recompute",
+        tenant_id=context.tenant_id,
+        session_id=execution_item.get("session_id"),
+        execution_id=execution_id,
+    )
+
+    return _build_evaluation_response(evaluation_item)
+
+
+@router.get("/executions/{execution_id}/code", response_model=CodeLogResponse)
+def get_execution_code(
+    execution_id: str,
+    limit: int = Query(200, ge=1, le=1000),
+    cursor: str | None = Query(default=None),
+    context: ApiKeyContext = Depends(require_api_key),
+    ddb_resource: ServiceResource = Depends(get_ddb_resource),
+    table_names: DdbTableNames = Depends(get_table_names),
+    logger: BoundLogger = Depends(get_logger),
+) -> CodeLogResponse:
+    executions_table = ddb_resource.Table(table_names.executions)
+    code_log_table = ddb_resource.Table(table_names.code_log)
+
+    execution_item = _get_execution_for_tenant(
+        executions_table, execution_id, context.tenant_id
+    )
+    ensure_tenant_access(execution_item, context.tenant_id)
+
+    start_key = _decode_cursor(cursor) if cursor else None
+    items, last_key = ddb.list_code_log_entries(
+        code_log_table,
+        execution_id=execution_id,
+        limit=limit,
+        exclusive_start_key=start_key,
+    )
+    entries: list[CodeLogEntry] = []
+    for item in items:
+        entries.append(
+            CodeLogEntry(
+                execution_id=str(item.get("execution_id") or execution_id),
+                sequence=int(item.get("sequence") or 0),
+                created_at=str(item.get("created_at") or ""),
+                source=str(item["source"]),
+                kind=str(item["kind"]),
+                model_name=item.get("model_name"),
+                tool_type=item.get("tool_type"),
+                content=state_store.normalize_json_value(item.get("content")),
+            )
+        )
+    next_cursor = None
+    if items:
+        key = last_key or {"PK": items[-1]["PK"], "SK": items[-1]["SK"]}
+        next_cursor = _encode_cursor(key)
+
+    logger.info(
+        "executions.code",
+        tenant_id=context.tenant_id,
+        execution_id=execution_id,
+        returned=len(entries),
+    )
+
+    return CodeLogResponse(entries=entries, next_cursor=next_cursor)
 
 
 @router.post("/executions/{execution_id}/cancel", response_model=ExecutionStatusResponse)
@@ -650,6 +846,7 @@ def get_execution_steps(
             error=state_store.normalize_json_value(state_item.get("error")),
             checksum=state_item.get("checksum"),
             summary=state_store.normalize_json_value(state_item.get("summary")),
+            timings=state_store.normalize_json_value(state_item.get("timings")),
         )
         steps.append(step)
 
@@ -756,6 +953,7 @@ def create_runtime_execution(
     session_id: str,
     context: ApiKeyContext = Depends(require_api_key),
     settings: Settings = Depends(get_settings),
+    s3_client: BaseClient = Depends(get_s3_client),
     ddb_resource: ServiceResource = Depends(get_ddb_resource),
     table_names: DdbTableNames = Depends(get_table_names),
     logger: BoundLogger = Depends(get_logger),
@@ -786,6 +984,8 @@ def create_runtime_execution(
         document_items,
         options.readiness_mode,
         options.enable_search,
+        s3_client=s3_client,
+        verify_s3_objects=settings.verify_s3_objects_for_readiness,
     )
     if not readiness.ready:
         raise_http_error(ErrorCode.SESSION_NOT_READY, "Session not ready")
@@ -808,6 +1008,10 @@ def create_runtime_execution(
     state_payload: dict[str, JsonValue] = {
         "_tool_results": {"llm": {}, "search": {}},
         "_tool_status": {},
+        "_tool_schema": build_tool_schema(
+            subcalls_enabled=True,
+            search_enabled=options.enable_search,
+        ),
     }
     state_record = state_store.persist_state_payload(
         state=state_payload,
@@ -843,6 +1047,7 @@ def runtime_step(
     request: StepRequest,
     context: ApiKeyContext = Depends(require_api_key),
     settings: Settings = Depends(get_settings),
+    sandbox_runner: SandboxRunner = Depends(get_sandbox_runner),
     ddb_resource: ServiceResource = Depends(get_ddb_resource),
     table_names: DdbTableNames = Depends(get_table_names),
     s3_client: BaseClient = Depends(get_s3_client),
@@ -852,6 +1057,7 @@ def runtime_step(
     documents_table = ddb_resource.Table(table_names.documents)
     executions_table = ddb_resource.Table(table_names.executions)
     execution_state_table = ddb_resource.Table(table_names.execution_state)
+    code_log_table = ddb_resource.Table(table_names.code_log)
 
     execution_item = _get_execution_for_tenant(
         executions_table, execution_id, context.tenant_id
@@ -905,6 +1111,10 @@ def runtime_step(
             _ensure_tool_state(state_input)
         except state_store.StateValidationError as exc:
             raise_http_error(ErrorCode.STATE_INVALID_TYPE, str(exc))
+        state_input["_tool_schema"] = build_tool_schema(
+            subcalls_enabled=True,
+            search_enabled=options.enable_search,
+        )
 
     turn_index = int(state_item.get("turn_index", -1)) + 1
     budgets = _resolve_budgets(None, session_item, settings)
@@ -922,13 +1132,17 @@ def runtime_step(
         limits=limits,
     )
 
-    result = execute_step(
+    timings: dict[str, int] = {}
+    sandbox_start = time.perf_counter()
+    result = sandbox_runner.run(
         event,
         s3_client=s3_client,
         region=settings.aws_region,
         endpoint_url=settings.localstack_endpoint_url,
     )
+    timings["sandbox_ms"] = int((time.perf_counter() - sandbox_start) * 1000)
 
+    state_persist_start = time.perf_counter()
     try:
         state_record = state_store.persist_state_payload(
             state=result.state,
@@ -942,6 +1156,7 @@ def runtime_step(
         raise_http_error(ErrorCode.STATE_INVALID_TYPE, str(exc))
     except state_store.StateOffloadError as exc:
         raise_http_error(ErrorCode.STATE_TOO_LARGE, str(exc))
+    timings["state_persist_ms"] = int((time.perf_counter() - state_persist_start) * 1000)
 
     updated_at = _format_timestamp(_utc_now())
     tool_requests_payload = (
@@ -963,6 +1178,7 @@ def runtime_step(
         state_s3_uri=state_record.state_s3_uri,
         checksum=state_record.checksum,
         summary=state_record.summary,
+        timings=timings,
         success=result.success,
         stdout=result.stdout,
         span_log=span_log_payload,
@@ -980,6 +1196,7 @@ def runtime_step(
         state_s3_uri=state_record.state_s3_uri,
         checksum=state_record.checksum,
         summary=state_record.summary,
+        timings=timings,
         success=result.success,
         stdout=result.stdout,
         span_log=span_log_payload,
@@ -987,6 +1204,14 @@ def runtime_step(
         final=final_payload,
         error=error_payload,
     )
+    if result.tool_requests:
+        code_logger = code_log.CodeLogWriter(
+            table=code_log_table,
+            execution_id=execution_id,
+            settings=settings,
+            logger=logger,
+        )
+        code_logger.write(code_log.build_tool_request_entries(result.tool_requests))
 
     if result.final and result.final.is_final:
         completed_at = _utc_now()
@@ -1039,6 +1264,7 @@ def resolve_tools(
     sessions_table = ddb_resource.Table(table_names.sessions)
     executions_table = ddb_resource.Table(table_names.executions)
     execution_state_table = ddb_resource.Table(table_names.execution_state)
+    code_log_table = ddb_resource.Table(table_names.code_log)
 
     execution_item = _get_execution_for_tenant(
         executions_table, execution_id, context.tenant_id
@@ -1136,6 +1362,13 @@ def resolve_tools(
         summary=state_record.summary,
         **step_snapshot,
     )
+    code_logger = code_log.CodeLogWriter(
+        table=code_log_table,
+        execution_id=execution_id,
+        settings=settings,
+        logger=logger,
+    )
+    code_logger.write(code_log.build_tool_result_entries(tool_results, statuses))
 
     logger.info(
         "executions.runtime.resolve_tools",

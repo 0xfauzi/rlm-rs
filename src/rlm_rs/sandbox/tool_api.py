@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 from pydantic import JsonValue
 
 from rlm_rs.models import (
@@ -12,6 +14,175 @@ from rlm_rs.models import (
 
 class ToolAPIError(Exception):
     pass
+
+
+TOOL_SCHEMA_VERSION = "v1"
+
+_TOOL_SPECS: list[dict[str, JsonValue]] = [
+    {
+        "name": "queue_llm",
+        "signature": (
+            "tool.queue_llm(key, prompt, *, model_hint=\"sub\", max_tokens=None, "
+            "max_output_tokens=None, max_output_chars=None, temperature=0, metadata=None)"
+        ),
+        "description": "Queue a sub-LLM call for the orchestrator to resolve.",
+        "params": [
+            {"name": "key", "kind": "positional", "type": "string", "required": True},
+            {"name": "prompt", "kind": "positional", "type": "string", "required": True},
+            {
+                "name": "model_hint",
+                "kind": "keyword",
+                "type": ["string", "null"],
+                "default": "sub",
+            },
+            {
+                "name": "max_tokens",
+                "kind": "keyword",
+                "type": ["integer", "null"],
+                "default": None,
+            },
+            {
+                "name": "max_output_tokens",
+                "kind": "keyword",
+                "type": ["integer", "null"],
+                "default": None,
+            },
+            {
+                "name": "max_output_chars",
+                "kind": "keyword",
+                "type": ["integer", "null"],
+                "default": None,
+            },
+            {
+                "name": "temperature",
+                "kind": "keyword",
+                "type": ["number", "null"],
+                "default": 0,
+            },
+            {
+                "name": "metadata",
+                "kind": "keyword",
+                "type": ["object", "null"],
+                "default": None,
+            },
+        ],
+        "aliases": {
+            "max_output_tokens": "max_tokens",
+            "max_output_chars": "max_tokens",
+        },
+        "constraints": {
+            "exactly_one_of": ["max_tokens", "max_output_tokens", "max_output_chars"]
+        },
+        "returns": "None",
+    },
+    {
+        "name": "queue_search",
+        "signature": "tool.queue_search(key, query, *, k=10, filters=None)",
+        "description": "Queue a search request for the orchestrator to resolve.",
+        "params": [
+            {"name": "key", "kind": "positional", "type": "string", "required": True},
+            {"name": "query", "kind": "positional", "type": "string", "required": True},
+            {"name": "k", "kind": "keyword", "type": "integer", "default": 10},
+            {
+                "name": "filters",
+                "kind": "keyword",
+                "type": ["object", "null"],
+                "default": None,
+            },
+        ],
+        "returns": "None",
+    },
+    {
+        "name": "YIELD",
+        "signature": "tool.YIELD(reason=None)",
+        "description": "End the step so queued tools can be resolved.",
+        "params": [
+            {
+                "name": "reason",
+                "kind": "positional",
+                "type": ["string", "null"],
+                "default": None,
+            }
+        ],
+        "returns": "Raises ToolYield",
+    },
+    {
+        "name": "FINAL",
+        "signature": "tool.FINAL(answer)",
+        "description": "Finalize the execution with an answer.",
+        "params": [
+            {"name": "answer", "kind": "positional", "type": "string", "required": True}
+        ],
+        "returns": "Raises ToolFinal",
+    },
+]
+
+
+def _render_tool_signatures(specs: list[dict[str, JsonValue]]) -> str:
+    lines = ["Tool signatures"]
+    for spec in specs:
+        signature = spec.get("signature")
+        if isinstance(signature, str) and signature:
+            lines.append(f"- {signature}")
+    return "\n".join(lines)
+
+
+TOOL_SIGNATURE_TEXT = _render_tool_signatures(_TOOL_SPECS)
+
+TOOL_SCHEMA_BASE: dict[str, JsonValue] = {
+    "version": TOOL_SCHEMA_VERSION,
+    "signature_text": TOOL_SIGNATURE_TEXT,
+    "tools": _TOOL_SPECS,
+}
+
+
+def tool_schema_base() -> dict[str, JsonValue]:
+    return copy.deepcopy(TOOL_SCHEMA_BASE)
+
+
+def _apply_availability(
+    schema: dict[str, JsonValue],
+    *,
+    name: str,
+    enabled: bool,
+    disabled_reason: str | None,
+) -> None:
+    tools = schema.get("tools")
+    if not isinstance(tools, list):
+        return
+    for spec in tools:
+        if not isinstance(spec, dict):
+            continue
+        if spec.get("name") != name:
+            continue
+        availability: dict[str, JsonValue] = {"enabled": enabled}
+        if not enabled and disabled_reason:
+            availability["disabled_reason"] = disabled_reason
+        spec["availability"] = availability
+        return
+
+
+def build_tool_schema(
+    *,
+    subcalls_enabled: bool | None = None,
+    search_enabled: bool | None = None,
+) -> dict[str, JsonValue]:
+    schema = tool_schema_base()
+    if subcalls_enabled is not None:
+        _apply_availability(
+            schema,
+            name="queue_llm",
+            enabled=bool(subcalls_enabled),
+            disabled_reason="subcalls disabled",
+        )
+    if search_enabled is not None:
+        _apply_availability(
+            schema,
+            name="queue_search",
+            enabled=bool(search_enabled),
+            disabled_reason="search disabled",
+        )
+    return schema
 
 
 class ToolRequestLimitError(ToolAPIError):
@@ -44,16 +215,32 @@ class ToolAPI:
         prompt: str,
         *,
         model_hint: str | None = "sub",
-        max_tokens: int,
+        max_tokens: int | None = None,
+        max_output_tokens: int | None = None,
+        max_output_chars: int | None = None,
         temperature: float | None = 0,
         metadata: dict[str, JsonValue] | None = None,
     ) -> None:
+        provided_count = sum(
+            value is not None
+            for value in (max_tokens, max_output_tokens, max_output_chars)
+        )
+        if provided_count != 1:
+            raise ToolAPIError(
+                "queue_llm requires exactly one of max_tokens, max_output_tokens, max_output_chars"
+            )
+        if max_tokens is not None:
+            resolved_max_tokens = max_tokens
+        elif max_output_tokens is not None:
+            resolved_max_tokens = max_output_tokens
+        else:
+            resolved_max_tokens = max_output_chars
         self._ensure_capacity()
         request = LLMToolRequest(
             key=key,
             prompt=prompt,
             model_hint=model_hint,
-            max_tokens=max_tokens,
+            max_tokens=resolved_max_tokens,
             temperature=temperature,
             metadata=metadata,
         )
@@ -76,6 +263,9 @@ class ToolAPI:
 
     def FINAL(self, answer: str) -> None:
         raise ToolFinal(answer)
+
+    def schema(self) -> dict[str, JsonValue]:
+        return tool_schema_base()
 
     @property
     def tool_requests(self) -> ToolRequestsEnvelope:

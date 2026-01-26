@@ -1,3 +1,7 @@
+# Component diagram
+
+This is the high-level component diagram for RLM-RS. It is intentionally implementation-oriented (ECS + Lambda + S3/DynamoDB) and should stay aligned with `docs/rls_spec.md` and the running `compose.yaml` stack.
+
 ```mermaid
 %%{init: {"flowchart": {"nodeSpacing": 70, "rankSpacing": 70}, "themeVariables": {"fontSize": "18px"}}}%%
 flowchart LR

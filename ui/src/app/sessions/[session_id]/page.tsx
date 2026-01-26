@@ -404,6 +404,7 @@ export default function SessionDetailPage() {
         isOpen={isAnswererOpen}
         onClose={() => setIsAnswererOpen(false)}
         sessionId={sessionId}
+        budgetsDefault={session?.budgets_default ?? null}
       />
       <StartRuntimeModal
         isOpen={isRuntimeOpen}

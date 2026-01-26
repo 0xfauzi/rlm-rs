@@ -299,8 +299,8 @@ Sandbox global context is a ContextView:
 - doc[a:b] returns the slice and logs the span access
 - doc.slice(a, b, tag=None) same
 - Optional helpers (if meta exists):
-  - doc.find(substr, start=0, end=None, max_hits=20)
-  - doc.regex(pattern, start=0, end=None, max_hits=20)
+- doc.find(substr, *, start=0, end=None, max_hits=20)
+- doc.regex(pattern, *, start=0, end=None, max_hits=20)
   - doc.sections() returns structured spans from meta
   - doc.page_spans() returns page-level spans from meta
 
@@ -1405,8 +1405,10 @@ You will write Python inside a fenced code block labelled `repl`. The sandbox pr
 - state: a JSON-serializable dict persisted between steps.
   - Use state["work"] as your workspace (create it if missing).
   - Tool results appear in state["_tool_results"].
+  - Tool schema is in state["_tool_schema"] (JSON) and tool.schema() (static spec).
 
 - tool: a ToolAPI for queuing external operations (the sandbox has no network).
+  - Use state["_tool_schema"] for exact parameters, aliases, and constraints.
   - tool.queue_llm(key, prompt, model_hint="sub", max_tokens=..., temperature=0, metadata=None)
   - tool.queue_search(key, query, k=10, filters=None) (only if enabled)
   - tool.YIELD(reason=None) ends the step so the orchestrator can resolve queued tools.

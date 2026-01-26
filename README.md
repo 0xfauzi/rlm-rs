@@ -16,7 +16,7 @@ The design follows the Recursive Language Models paper and the consolidated spec
 
 - A long-lived REPL server for arbitrary code.
 - Untrusted multi-tenant sandboxing against adversarial code.
-- A user-facing UI.
+- A polished end-user UI (the UI in `ui/` is developer-facing).
 
 ## Architecture at a glance
 
@@ -247,7 +247,7 @@ sequenceDiagram
       API-->>Client: 200 {status=COMPLETED, answer, citations, trace_s3_uri}
     else error returned
       API-->>Client: 200 {success=false, error, stdout, state, span_log}
-      Note over Client: Client decides whether to retry, modify code, or abort.
+      Note over Client: Client decides whether to retry, modify code, or cancel.
     else no final
       API-->>Client: 200 {success=true, stdout, state, span_log, tool_requests}
     end
@@ -294,11 +294,11 @@ sequenceDiagram
     end
   end
 
-  %% --- Optional: Abort/cleanup ---
-  opt client aborts
-    Client->>API: POST /v1/executions/{execution_id}/abort
-    API->>DDB: Mark execution FAILED/ABORTED
-    API-->>Client: 200 {status=ABORTED}
+  %% --- Optional: Cancel ---
+  opt client cancels
+    Client->>API: POST /v1/executions/{execution_id}/cancel
+    API->>DDB: Mark execution CANCELLED
+    API-->>Client: 200 {status=CANCELLED}
   end
 
 ```
@@ -310,6 +310,7 @@ Core services:
 - Ingestion worker: parses documents via the parser service and writes parsed outputs.
 - Sandbox step runtime: AWS Lambda compatible step executor with strict limits.
 - Storage: DynamoDB for metadata and S3 for parsed text, state blobs, traces, and caches.
+- UI (Next.js): developer-facing UI for sessions, executions, and citations.
 - Optional services: MCP server wrapper and a search backend.
 
 Security boundaries:
@@ -349,6 +350,9 @@ Runtime mode is client-driven:
 - `src/rlm_rs/storage`: DynamoDB and S3 helpers.
 - `src/rlm_rs/parser`: parser service and client.
 - `src/rlm_rs/mcp`: MCP server wrapper for the HTTP API.
+- `src/rlm_rs/finetune`: trace export and dataset prep helpers.
+- `scripts/`: operational scripts and evaluation utilities.
+- `ui/`: developer-facing UI for sessions/executions/citations.
 - `docs/`: spec, architecture, and sequence diagrams.
 
 ## Local development
@@ -361,7 +365,7 @@ Prerequisites:
 
 ### Option A: Docker Compose
 
-This runs LocalStack plus API, parser, and workers.
+This runs LocalStack plus API, parser, workers, and the UI.
 
 ```bash
 export LLM_PROVIDER=fake
@@ -389,6 +393,8 @@ Check health:
 ```bash
 curl -fsS http://localhost:8080/health/ready
 ```
+
+Open the UI at `http://localhost:3000`.
 
 ### Option B: Run services locally with uv
 
@@ -448,7 +454,7 @@ WORKER_MODE=orchestrator uv run python -m rlm_rs.worker_entrypoint
 ./scripts/smoke_test.sh
 ```
 
-### Manual end-to-end (LocalStack + OpenAI) — fast path
+### Manual end-to-end (LocalStack + OpenAI): fast path
 
 This is the minimal “real user” flow against the running stack using OpenAI. It assumes `LLM_PROVIDER=openai`, `OPENAI_API_KEY` set in `.env`, and `docker compose up --build` is running.
 
@@ -481,8 +487,8 @@ printf 'Answerer flow regression test.' | docker compose exec -T localstack awsl
 SESSION_ID=$(curl -s -X POST http://localhost:8080/v1/sessions \
   -H "Authorization: Bearer rlm_key_local" \
   -H "Content-Type: application/json" \
-  -d "{\"ttl_minutes\":60,\"docs\":[{\"source_name\":\"sample.txt\",\"mime_type\":\"text/plain\",\"raw_s3_uri\":\"${RAW_URI}\"}]}\" \
-  | python - <<'PY'
+  -d "{\"ttl_minutes\":60,\"docs\":[{\"source_name\":\"sample.txt\",\"mime_type\":\"text/plain\",\"raw_s3_uri\":\"${RAW_URI}\"}]}" \
+  | uv run python - <<'PY'
 import sys, json; print(json.load(sys.stdin)["session_id"])
 PY
 )
@@ -496,7 +502,7 @@ EXEC_ID=$(curl -s -X POST http://localhost:8080/v1/sessions/${SESSION_ID}/execut
   -H "Authorization: Bearer rlm_key_local" \
   -H "Content-Type: application/json" \
   -d '{"question":"Summarize the document in one short sentence."}' \
-  | python - <<'PY'
+  | uv run python - <<'PY'
 import sys, json; print(json.load(sys.stdin)["execution_id"])
 PY
 )
@@ -512,7 +518,7 @@ done
 ```bash
 RUNTIME_EXEC=$(curl -s -X POST http://localhost:8080/v1/sessions/${SESSION_ID}/executions/runtime \
   -H "Authorization: Bearer rlm_key_local" \
-  -H "Content-Type: application/json" | python - <<'PY'
+  -H "Content-Type: application/json" | uv run python - <<'PY'
 import sys, json; print(json.load(sys.stdin)["execution_id"])
 PY
 )
@@ -525,6 +531,14 @@ curl -s -X POST http://localhost:8080/v1/executions/${RUNTIME_EXEC}/steps \
 Debug/inspection helpers:
 - `docker compose logs <service>` for API/parser/worker errors.
 - `docker compose exec -T localstack awslocal s3 ls s3://rlm-local/parsed/...` and `awslocal dynamodb scan --table-name rlm_executions` to inspect artifacts.
+
+## Finetuning and evaluation
+
+- `docs/fine_tuning_rlm_policy.md` captures policy and data-shaping guidance.
+- `scripts/export_finetune_traces.py` exports execution traces for analysis or dataset generation.
+- `scripts/build_finetune_datasets.py` prepares datasets from stored traces/logs.
+- `scripts/evaluate_finetuned_policy.py` evaluates finetuned policies against stored traces.
+- `scripts/recompute_evaluation.py` recomputes evaluation outputs from stored artifacts.
 
 ## Authentication and API keys
 
@@ -587,8 +601,19 @@ Common environment variables:
 - `LLM_PROVIDER` with `OPENAI_API_KEY` for OpenAI or `LLM_PROVIDER=fake` for local runs
 - `DEFAULT_ROOT_MODEL`, `DEFAULT_SUB_MODEL`
 - `DEFAULT_BUDGETS_JSON`, `DEFAULT_MODELS_JSON`
+- `SANDBOX_RUNNER`, `SANDBOX_LAMBDA_FUNCTION_NAME`, `SANDBOX_LAMBDA_TIMEOUT_SECONDS`
+- `ENABLE_ROOT_STATE_SUMMARY`
+- `TOOL_RESOLUTION_MAX_CONCURRENCY`
 
 See `src/rlm_rs/settings.py` and `compose.yaml` for the full list.
+
+## Enterprise deployment notes
+
+- Run the sandbox in Lambda by setting `SANDBOX_RUNNER=lambda` and wiring `SANDBOX_LAMBDA_FUNCTION_NAME`.
+- Keep the Lambda in a VPC with no NAT and only an S3 gateway endpoint; do not grant provider secrets.
+- Deploy per region (or per tenant) to ensure S3/DDB/Lambda/ECS and the LLM provider remain in-region.
+- Use `ENABLE_ROOT_STATE_SUMMARY` if you want the root prompt to receive key/count-only state summaries.
+- Tune `TOOL_RESOLUTION_MAX_CONCURRENCY` to bound parallel tool resolution.
 
 ## Docs
 
@@ -597,6 +622,7 @@ See `src/rlm_rs/settings.py` and `compose.yaml` for the full list.
 - `docs/sequence.md`: Answerer mode sequence.
 - `docs/runtime_sequence.md`: Runtime mode sequence.
 - `docs/plan.md`: implementation plan and library choices.
+- `docs/fine_tuning_rlm_policy.md`: finetuning policy and data guidance.
 
 ## Status
 

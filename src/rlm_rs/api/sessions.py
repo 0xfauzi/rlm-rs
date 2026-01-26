@@ -5,10 +5,13 @@ import binascii
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from boto3.dynamodb.conditions import Key
 from boto3.resources.base import ServiceResource
+from botocore.client import BaseClient
+from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, Query
 from structlog.stdlib import BoundLogger
 
@@ -16,6 +19,7 @@ from rlm_rs.api.auth import ApiKeyContext, ensure_tenant_access, require_api_key
 from rlm_rs.api.dependencies import (
     get_ddb_resource,
     get_logger,
+    get_s3_client,
     get_settings,
     get_table_names,
 )
@@ -84,6 +88,41 @@ def _decode_cursor(cursor: str) -> dict[str, str]:
     if not isinstance(pk, str) or not isinstance(sk, str):
         raise_http_error(ErrorCode.VALIDATION_ERROR, "Invalid cursor")
     return {"PK": pk, "SK": sk}
+
+
+def _split_s3_uri(uri: str) -> tuple[str, str]:
+    parsed = urlparse(uri)
+    if parsed.scheme != "s3" or not parsed.netloc:
+        raise ValueError(f"Invalid S3 URI: {uri}")
+    return parsed.netloc, parsed.path.lstrip("/")
+
+
+def _s3_object_exists(client: BaseClient, s3_uri: str | None) -> bool:
+    if not isinstance(s3_uri, str) or not s3_uri:
+        return False
+    try:
+        bucket, key = _split_s3_uri(s3_uri)
+    except ValueError:
+        return False
+    try:
+        client.head_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return False
+        return False
+    return True
+
+
+def _documents_have_s3_objects(docs: list[Mapping[str, Any]], s3_client: BaseClient) -> bool:
+    for doc in docs:
+        text_s3_uri = doc.get("text_s3_uri")
+        offsets_s3_uri = doc.get("offsets_s3_uri")
+        if not _s3_object_exists(s3_client, text_s3_uri):
+            return False
+        if not _s3_object_exists(s3_client, offsets_s3_uri):
+            return False
+    return True
 
 
 def _normalize_options(options: SessionOptions | None, settings: Settings) -> SessionOptions:
@@ -175,9 +214,16 @@ def _compute_readiness(
     docs: list[Mapping[str, Any]],
     readiness_mode: str,
     enable_search: bool,
+    *,
+    s3_client: BaseClient | None = None,
+    verify_s3_objects: bool = False,
 ) -> SessionReadiness:
     parsed_ready = all(doc.get("ingest_status") in _PARSED_READY for doc in docs)
     search_ready = all(doc.get("ingest_status") in _SEARCH_READY for doc in docs)
+    if verify_s3_objects and s3_client is not None and parsed_ready:
+        if not _documents_have_s3_objects(docs, s3_client):
+            parsed_ready = False
+            search_ready = False
     if not enable_search:
         search_ready = False
     ready = search_ready if readiness_mode == "STRICT" else parsed_ready
@@ -379,6 +425,7 @@ def get_session(
     session_id: str,
     context: ApiKeyContext = Depends(require_api_key),
     settings: Settings = Depends(get_settings),
+    s3_client: BaseClient = Depends(get_s3_client),
     ddb_resource: ServiceResource = Depends(get_ddb_resource),
     table_names: DdbTableNames = Depends(get_table_names),
     logger: BoundLogger = Depends(get_logger),
@@ -402,13 +449,25 @@ def get_session(
         SessionOptions.model_validate(session_item.get("options") or {}), settings
     )
 
+    budgets_default: Budgets | None = None
+    if session_item.get("budgets_default"):
+        budgets_default = Budgets.model_validate(session_item.get("budgets_default"))
+    elif settings.default_budgets_json is not None:
+        budgets_default = Budgets.model_validate(settings.default_budgets_json)
+
     document_items = _query_documents(documents_table, session_id)
     for item in document_items:
         ensure_tenant_access(item, context.tenant_id)
 
     document_items.sort(key=lambda item: item.get("doc_index", 0))
     docs = [_build_document_status(item) for item in document_items]
-    readiness = _compute_readiness(document_items, options.readiness_mode, options.enable_search)
+    readiness = _compute_readiness(
+        document_items,
+        options.readiness_mode,
+        options.enable_search,
+        s3_client=s3_client,
+        verify_s3_objects=settings.verify_s3_objects_for_readiness,
+    )
 
     logger.info(
         "sessions.get",
@@ -422,6 +481,7 @@ def get_session(
         status=session_item["status"],
         created_at=session_item["created_at"],
         expires_at=session_item["expires_at"],
+        budgets_default=budgets_default,
         readiness=readiness,
         docs=docs,
     )

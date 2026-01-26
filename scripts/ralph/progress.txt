@@ -1,6 +1,7 @@
 # Ralph Progress Log
 
 ## Codebase Patterns
+- Evaluation records persist baseline_answer, baseline_input_tokens, and baseline_context_window keys even when they are None.
 - Use `UV_CACHE_DIR=/tmp/uv-cache` for `uv` commands in this sandbox to avoid cache permission errors.
 - Use `NPM_CONFIG_CACHE=/tmp/npm-cache` for npm commands in this sandbox to avoid cache permission errors.
 - If LocalStack state persists, set a unique `DDB_TABLE_PREFIX` for integration tests to avoid conditional write collisions.
@@ -16,11 +17,14 @@
 - API rate limits are stored in `app.state.rate_limiter` from `RATE_LIMITS_JSON` using `max_requests` and `window_seconds` (optional per-tenant overrides).
 - Request size limits read `REQUEST_SIZE_LIMIT_BYTES` via `app.state.request_size_limit_bytes` and block oversized bodies in middleware.
 - Metrics are exposed at `/metrics` when `ENABLE_METRICS=true`.
+- When persisting float metrics to DynamoDB, run them through `_coerce_decimals` before `put_item`.
 - `scripts/smoke_test.sh` writes JSON summaries to `SMOKE_OUTPUT_JSON`, and `KEEP_DOCKER=1` keeps LocalStack state across repeated runs.
 - MCP server wrapper lives in `rlm_rs.mcp` and reads `RLM_BASE_URL` and `RLM_API_KEY` from env.
 - Search tool resolution uses `SearchBackend`; disabled search records a spec-style error in tool results.
 - Search indexing uses `SEARCH_BACKEND_CONFIG` with `chunk_size_chars`, `chunk_overlap_chars`, and `index_prefix`, and caches search results under `cache/{tenant_id}/search/{sha256}.json` (configurable via `cache_prefix`).
+- Code logs are stored in the `code_log` DynamoDB table with PK `EXEC#<execution_id>` and SK `CODE#<zero-padded sequence>`; use `CodeLogWriter` to persist entries and apply trace redaction.
 - Next.js pages that call `useSearchParams` must wrap the client component in a `Suspense` boundary to avoid build-time prerender errors.
+- UI unit tests run via `npm run test --prefix ui`; use `@vitest-environment node` for Web Crypto coverage.
 
 ## Iteration Notes
 - (append entries below using the format in prompt.md)
@@ -485,4 +489,77 @@
 - **Learnings:**
   - Patterns discovered: none
   - Gotchas encountered: none
+---
+## 2026-01-21 - US-058
+- What was implemented: Added evaluation table names and helpers, evaluation models, LocalStack init for evaluations, and unit coverage for evaluation records.
+- Files changed: src/rlm_rs/storage/ddb.py, src/rlm_rs/models.py, scripts/localstack_init.sh, tests/unit/test_api_auth.py, tests/unit/test_api_sessions.py, tests/unit/test_api_limits.py, tests/unit/test_api_spans.py, tests/unit/test_ingestion_worker.py, tests/unit/test_api_executions.py, tests/unit/test_api_runtime.py, tests/unit/test_evaluations.py, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q tests/unit -k evaluation
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-21 - US-059
+- What was implemented: Added baseline prompt builder with OpenAI Responses token fit checks, plus settings and env wiring for model context windows.
+- Files changed: .env.example, compose.yaml, scripts/ralph/prd.json, scripts/ralph/progress.txt, src/rlm_rs/orchestrator/baseline.py, src/rlm_rs/settings.py, tests/unit/test_baseline.py
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q tests/unit -k baseline
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-21 - US-060
+- What was implemented: Added baseline evaluation creation on answerer completion with fit checks and persistence plus integration coverage for answerer/runtime evaluation records.
+- Files changed: src/rlm_rs/orchestrator/baseline.py, src/rlm_rs/orchestrator/providers.py, src/rlm_rs/orchestrator/worker.py, tests/unit/test_baseline.py, tests/integration/test_evaluation.py, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q tests/unit -k baseline; UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q tests/integration -k evaluation
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: Integration tests skip when LocalStack is unavailable.
+---
+## 2026-01-21 - US-061
+- What was implemented: Added evaluation response model and GET /v1/executions/{execution_id}/evaluation with runtime guard, tenant checks, and unit coverage.
+- Files changed: src/rlm_rs/models.py, src/rlm_rs/api/executions.py, tests/unit/test_api_executions.py, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q tests/unit -k evaluation_api
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+
+## 2026-01-21 - US-062
+- What was implemented: Added Ragas-based judge evaluation with env-configured settings, persisted judge metrics on evaluation records, and unit coverage with mocked judge execution.
+- Files changed: .env.example, compose.yaml, pyproject.toml, uv.lock, src/rlm_rs/settings.py, src/rlm_rs/models.py, src/rlm_rs/storage/ddb.py, src/rlm_rs/api/executions.py, src/rlm_rs/orchestrator/worker.py, src/rlm_rs/orchestrator/eval_judge.py, tests/unit/test_eval_judge.py, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q tests/unit -k eval_judge
+- **Learnings:**
+  - Patterns discovered: Persisting float metrics to DynamoDB requires Decimal coercion via _coerce_decimals.
+  - Gotchas encountered: none
+---
+## 2026-01-21 - US-063
+- What was implemented: Added evaluation types and client fetch, plus a Baseline panel on execution detail with status, tokens, skip reason, and answer rendering alongside Answer; ensured evaluation records persist baseline fields even when null.
+- Files changed: ui/src/lib/types.ts, ui/src/lib/api-client.ts, ui/src/app/executions/[execution_id]/page.tsx, src/rlm_rs/storage/ddb.py, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q; NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run lint --prefix ui
+- **Learnings:**
+  - Patterns discovered: Evaluation records keep baseline_* keys even when values are null.
+  - Gotchas encountered: Integration tests expect explicit baseline_* null fields in DDB evaluation items.
+---
+## 2026-01-21 - US-064
+- What was implemented: Added the Evaluation section on execution detail to surface LLM judge metrics with formatted scores and empty-state handling.
+- Files changed: ui/src/app/executions/[execution_id]/page.tsx, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run lint --prefix ui; UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-22 - US-068
+- What was implemented: Added code logging models, storage helpers, API endpoint, orchestrator/runtime logging, and UI Code panel with filters and polling.
+- Files changed: src/rlm_rs/models.py, src/rlm_rs/storage/ddb.py, src/rlm_rs/code_log.py, src/rlm_rs/orchestrator/worker.py, src/rlm_rs/api/executions.py, scripts/localstack_init.sh, tests/unit/test_code_log.py, tests/integration/test_orchestrator_answerer.py, tests/unit/test_eval_judge.py, tests/unit/test_api_auth.py, tests/unit/test_api_executions.py, tests/unit/test_api_limits.py, tests/unit/test_api_runtime.py, tests/unit/test_api_sessions.py, tests/unit/test_api_spans.py, tests/unit/test_ingestion_worker.py, ui/src/lib/types.ts, ui/src/lib/api-client.ts, ui/src/app/executions/[execution_id]/page.tsx
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q; NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run lint --prefix ui
+- **Learnings:**
+  - Patterns discovered: Code logs use the code_log table with EXEC# and CODE# keys, written via CodeLogWriter.
+  - Gotchas encountered: Eval judge FakeTable needs update_item support for update_evaluation.
+---
+## 2026-01-22 - US-069
+- What was implemented: Added a CodeBlock component for REPL logs with preserved whitespace, wired it into the execution Code panel, and introduced Vitest-backed UI unit tests.
+- Files changed: ui/package-lock.json, ui/package.json, ui/src/app/executions/[execution_id]/page.tsx, ui/src/components/ui/CodeBlock.test.tsx, ui/src/components/ui/CodeBlock.tsx, ui/src/lib/crypto.test.ts, ui/vitest.config.ts, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_test_$(date +%s) uv run pytest -q; NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run lint --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm run test --prefix ui
+- **Learnings:**
+  - Patterns discovered: Vitest runs UI unit tests via `npm run test --prefix ui` with per-file environment overrides.
+  - Gotchas encountered: Existing Node test files need migration to Vitest to avoid empty-suite failures.
 ---

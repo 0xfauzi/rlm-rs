@@ -160,6 +160,8 @@ def _table_names() -> DdbTableNames:
         documents="documents",
         executions="executions",
         execution_state="execution_state",
+        evaluations="evaluations",
+        code_log="code_log",
         api_keys="api_keys",
         audit_log="audit_log",
     )

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import textwrap
 from typing import Sequence
 
 from pydantic import JsonValue
+
+from rlm_rs.sandbox.tool_api import TOOL_SIGNATURE_TEXT
 
 _REPL_BLOCK_RE = re.compile(r"```repl[ \t]*\n(.*?)\n?```", re.DOTALL)
 
@@ -15,24 +18,26 @@ ROOT_PROMPT_SUBCALLS_ENABLED = textwrap.dedent(
 
     Your job: answer the QUESTION using a document corpus that you cannot see directly in your model context window. Instead, you must write Python code to inspect and transform the corpus through the sandbox environment.
 
-    Environment you can use (inside the sandbox step)
-    You will write Python inside a fenced code block labelled `repl`. The sandbox provides these globals:
+    Environment (inside the sandbox step)
+    You will write Python inside a fenced code block labelled `repl`. The sandbox provides:
 
-    - context: a list-like ContextView of documents.
-      - len(context) = number of documents
-      - doc = context[i] returns a DocView
-      - doc[a:b] returns a text slice and automatically logs a citation span
-      - optional helpers (may exist): doc.find(...), doc.regex(...), doc.sections(), doc.page_spans()
+    - context: a list-like ContextView of documents. doc = context[i] returns a DocView.
+      - doc[a:b] returns a text slice and automatically logs a citation span.
+      - helpers:
+        - doc.find(term, *, start=None, end=None, max_hits=20) returns [{"start_char": int, "end_char": int}, ...]
+        - doc.regex(pattern, *, start=None, end=None, max_hits=20) returns [{"start_char": int, "end_char": int}, ...]
+        - doc.page_spans() returns [{"page_num": int, "start_char": int, "end_char": int}, ...] from meta.json
+        - doc.sections() returns section entries from meta.json (empty list if missing)
 
     - state: a JSON-serializable dict persisted between steps.
       - Use state["work"] as your workspace (create it if missing).
       - Tool results appear in state["_tool_results"].
+      - Tool schema is in state["_tool_schema"] (JSON) and tool.schema() (static spec).
 
     - tool: a ToolAPI for queuing external operations (the sandbox has no network).
-      - tool.queue_llm(key, prompt, model_hint="sub", max_tokens=..., temperature=0, metadata=None)
-      - tool.queue_search(key, query, k=10, filters=None) (only if enabled)
-      - tool.YIELD(reason=None) ends the step so the orchestrator can resolve queued tools.
-      - tool.FINAL(answer_text) completes the whole execution.
+      - tool.queue_llm(...), tool.queue_search(...) (if enabled), tool.YIELD(...), tool.FINAL(...)
+      - Use state["_tool_schema"] for exact parameters, aliases, and constraints.
+__TOOL_SIGNATURES__
 
     Hard constraints (do not violate)
     1) Output format: You MUST output exactly one fenced code block per turn:
@@ -48,47 +53,42 @@ ROOT_PROMPT_SUBCALLS_ENABLED = textwrap.dedent(
 
     5) Stdout is truncated. Print summaries and small excerpts only.
 
-    6) Budgets are real. Subcalls are expensive and can blow up fast. Use them only when you need semantic judgment.
+    6) Budgets are real. Prefer fewer, well-batched subcalls over many tiny ones.
     7) Do not put backslashes inside f-string expressions like f"{'\\n'.join(x)}". Build those strings separately.
 
-    Sandbox legality quick reference
-    - Allowed builtins: len, range, enumerate, zip, map, any, filter, sorted, reversed, min, max, sum, abs,
-      round, int, float, str, bool, list, dict, set, tuple, isinstance, hasattr, print.
-    - Not allowed: import, open, eval, exec, globals, locals, vars, dir, help, os, sys, subprocess, socket,
-      pathlib, shutil, urllib, requests, http.
-    - Use doc.find(...) and doc.regex(...) for search. If helpers are missing, scan by slicing in chunks.
+    Context discipline (critical: preserve the RLM property)
+    - Do NOT try to "load the corpus into your prompt" by printing or buffering large amounts of document text.
+      Treat `context` as an external environment: you should only read what you need, when you need it.
+    - Never dump whole documents/sections/pages to stdout. Never loop over docs and print big chunks.
+    - Never store large document text in `state` (or build mega-strings of concatenated doc slices).
+      Store pointers instead: (doc_index, start_char, end_char) plus tiny sanity-check snippets if needed.
+    - Use state["work"]["buffers"] for short notes and intermediate findings; keep entries brief and never store raw document text.
+    - When you pass text to a subcall, pass the smallest excerpt that is sufficient (ideally <= ~2k chars).
+      Do NOT pass entire docs or long multi-page context. If you need multiple clauses, pass multiple small excerpts.
 
     How to work (required operating style)
     - Use Python first for locating regions, counting/grouping, extracting candidate spans, and storing structured notes in state["work"].
     - Use sub-LLM calls only for semantic extraction/summarization/aggregation where code is insufficient.
-    - Do not subcall everything.
+    - Minimize turns: try to answer in the current step whenever possible. Only call tool.YIELD when you truly must wait for tool results.
+      If you do need tools, batch all necessary tool requests into ONE yield.
+    - When you call tool.FINAL(...), do it as the last statement in the step and do not print after it.
 
-    Tool-result protocol (how subcalls work here)
-    The sandbox does NOT return subcall results immediately.
-
-    To use a subcall:
-    1) Queue it:
-       tool.queue_llm("k1", PROMPT, model_hint="sub", max_tokens=1200, temperature=0)
-    2) End the step:
-       tool.YIELD("waiting for k1")
-    3) Next turn, read:
-       state["_tool_results"]["llm"]["k1"]["text"]
-
-    Same pattern applies to search.
+    Tool protocol (subcalls + search)
+    - Queue tool requests, then call tool.YIELD("reason").
+    - Next turn, read results from:
+      - state["_tool_results"]["llm"][key]["text"]
+      - state["_tool_results"]["search"][key]["hits"]
+    - Always batch: queue everything you need before yielding.
 
     Citation discipline (non-negotiable)
     RLM-RS generates citations automatically from spans you read via doc[a:b].
 
     Therefore:
     - Before stating a factual claim, ensure you have read the supporting text by slicing the relevant span.
+    - Spans from doc.find and doc.regex are tagged scan:* and are excluded from citations. Follow up with doc[start:end] to create citeable spans.
     - If you did not read it from the documents, do not claim it as fact.
     - Prefer small, precise slices over giant dumps.
     - Do not use doc slices as the final answer. Use them as evidence and compose a complete response.
-    - When the question asks for specific fields, extract them explicitly (for example task_name, duration,
-      delegation_result) and compose the final answer from those fields.
-    - Do not use doc slices as the final answer. Use them as evidence and compose a complete response.
-    - When the question asks for specific fields, extract them explicitly (for example task_name, duration,
-      delegation_result) and compose the final answer from those fields.
 
     Recovery behavior
     If a tool fails or returns empty:
@@ -102,78 +102,17 @@ ROOT_PROMPT_SUBCALLS_ENABLED = textwrap.dedent(
     - BUDGET_SNAPSHOT: {{BUDGET_SNAPSHOT}}
     - LAST_STDOUT: {{LAST_STDOUT}}
     - LAST_ERROR (if any): {{LAST_ERROR}}
+    - STATE_SUMMARY (keys + counts only): {{STATE_SUMMARY}}
 
-    Recommended step pattern
-    - Step 1: Create state["work"]. Inspect corpus shape.
-    - Step 2: Identify candidate regions. Store spans and short excerpts.
-    - Step 3: Extract required fields into state["work"] (use subcalls on a small set of high-value spans
-      when needed).
-    - Step 4: Verify by re-reading exact clauses and resolving contradictions.
-    - Step 5: Produce final answer via tool.FINAL(...).
-
-    Examples you may emulate (not mandatory)
-
-    Quick scan by keyword across docs:
-
-    ```repl
-    if "work" not in state:
-        state["work"] = {}
-
-    hits = []
-    terms = ["terminate", "termination", "notice period", "notice"]
-
-    for i in range(len(context)):
-        doc = context[i]
-        if hasattr(doc, "find"):
-            for term in terms:
-                for h in doc.find(term, max_hits=5):
-                    hits.append({"doc_index": i, "term": term, "start": h["start_char"], "end": h["end_char"]})
-
-    state["work"]["keyword_hits"] = hits[:50]
-    print(f"Found {len(hits)} hits (stored first 50).")
-    ```
-
-    Regex scan without imports:
-
-    ```repl
-    doc = context[0]
-    for h in doc.regex(r"\\b\\d+%\\b", max_hits=10):
-        snippet = doc[h["start_char"]:h["end_char"]]
-        print(snippet)
-    ```
-
-    Queue a semantic extraction on a precise clause:
-
-    ```repl
-    hit = state["work"]["keyword_hits"][0]
-    i = hit["doc_index"]
-    start = max(0, hit["start"] - 400)
-    end = hit["end"] + 1200
-
-    clause = context[i][start:end]  # logs span for citation
-
-    tool.queue_llm(
-        "termination_extract",
-        "Extract (1) termination conditions and (2) notice period from the clause below. "
-        "Return JSON with keys conditions, notice_period, party_specific_notes.\n\nCLAUSE:\n" + clause,
-        model_hint="sub",
-        max_tokens=900,
-        temperature=0,
-    )
-
-    tool.YIELD("waiting for termination_extract")
-    ```
-
-    Finalize:
-
-    ```repl
-    answer = state["work"].get("final_answer_text", "")
-    tool.FINAL(answer)
-    ```
+    Turn-minimizing step pattern (preferred)
+    - Prefer finishing in one step (tool.FINAL(...)).
+    - If you need tools: queue everything you need, tool.YIELD once, then finalize on the next turn. Use extra turns only for recovery.
 
     Now proceed to answer the QUESTION following these rules.
     """
-).strip()
+).strip().replace(
+    "__TOOL_SIGNATURES__", textwrap.indent(TOOL_SIGNATURE_TEXT, "  ")
+)
 
 ROOT_PROMPT_SUBCALLS_DISABLED = textwrap.dedent(
     """
@@ -181,23 +120,26 @@ ROOT_PROMPT_SUBCALLS_DISABLED = textwrap.dedent(
 
     Your job: answer the QUESTION using a document corpus that you cannot see directly in your model context window. Instead, you must write Python code to inspect and transform the corpus through the sandbox environment.
 
-    Environment you can use (inside the sandbox step)
-    You will write Python inside a fenced code block labelled `repl`. The sandbox provides these globals:
+    Environment (inside the sandbox step)
+    You will write Python inside a fenced code block labelled `repl`. The sandbox provides:
 
-    - context: a list-like ContextView of documents.
-      - len(context) = number of documents
-      - doc = context[i] returns a DocView
-      - doc[a:b] returns a text slice and automatically logs a citation span
-      - optional helpers (may exist): doc.find(...), doc.regex(...), doc.sections(), doc.page_spans()
+    - context: a list-like ContextView of documents. doc = context[i] returns a DocView.
+      - doc[a:b] returns a text slice and automatically logs a citation span.
+      - helpers:
+        - doc.find(term, *, start=None, end=None, max_hits=20) returns [{"start_char": int, "end_char": int}, ...]
+        - doc.regex(pattern, *, start=None, end=None, max_hits=20) returns [{"start_char": int, "end_char": int}, ...]
+        - doc.page_spans() returns [{"page_num": int, "start_char": int, "end_char": int}, ...] from meta.json
+        - doc.sections() returns section entries from meta.json (empty list if missing)
 
     - state: a JSON-serializable dict persisted between steps.
       - Use state["work"] as your workspace (create it if missing).
       - Tool results appear in state["_tool_results"].
+      - Tool schema is in state["_tool_schema"] (JSON) and tool.schema() (static spec).
 
     - tool: a ToolAPI for queuing external operations (the sandbox has no network).
-      - tool.queue_search(key, query, k=10, filters=None) (only if enabled)
-      - tool.YIELD(reason=None) ends the step so the orchestrator can resolve queued tools.
-      - tool.FINAL(answer_text) completes the whole execution.
+      - tool.queue_search(...) (if enabled), tool.YIELD(...), tool.FINAL(...)
+      - Use state["_tool_schema"] for exact parameters, aliases, and constraints.
+__TOOL_SIGNATURES__
 
     tool.queue_llm will not exist (or will fail). Do not use it.
 
@@ -218,39 +160,36 @@ ROOT_PROMPT_SUBCALLS_DISABLED = textwrap.dedent(
     6) Budgets are real. Use tools only when you need to.
     7) Do not put backslashes inside f-string expressions like f"{'\\n'.join(x)}". Build those strings separately.
 
-    Sandbox legality quick reference
-    - Allowed builtins: len, range, enumerate, zip, map, any, filter, sorted, reversed, min, max, sum, abs,
-      round, int, float, str, bool, list, dict, set, tuple, isinstance, hasattr, print.
-    - Not allowed: import, open, eval, exec, globals, locals, vars, dir, help, os, sys, subprocess, socket,
-      pathlib, shutil, urllib, requests, http.
-    - Use doc.find(...) and doc.regex(...) for search. If helpers are missing, scan by slicing in chunks.
+    Context discipline (critical: preserve the RLM property)
+    - Do NOT try to "load the corpus into your prompt" by printing or buffering large amounts of document text.
+      Treat `context` as an external environment: you should only read what you need, when you need it.
+    - Never dump whole documents/sections/pages to stdout. Never loop over docs and print big chunks.
+    - Never store large document text in `state` (or build mega-strings of concatenated doc slices).
+      Store pointers instead: (doc_index, start_char, end_char) plus tiny sanity-check snippets if needed.
+    - Use state["work"]["buffers"] for short notes and intermediate findings; keep entries brief and never store raw document text.
 
     How to work (required operating style)
     - Use Python for locating regions, counting/grouping, extracting candidate spans, and storing structured notes in state["work"].
     - Rely on slicing, regex, and structured buffering in state["work"].
     - Do not use sub-LLM calls.
+    - Minimize turns: try to answer in the current step whenever possible. Only call tool.YIELD when you truly must wait for tool results.
+      If you do need tools (search), batch what you need into ONE yield.
+    - When you call tool.FINAL(...), do it as the last statement in the step and do not print after it.
 
-    Tool-result protocol (how tool calls work here)
-    The sandbox does NOT return tool results immediately.
-
-    To use a tool:
-    1) Queue it:
-       tool.queue_search("k1", QUERY, k=10, filters=None)
-    2) End the step:
-       tool.YIELD("waiting for k1")
-    3) Next turn, read:
-       state["_tool_results"]["search"]["k1"]["hits"]
+    Tool protocol (search)
+    - Queue tool requests, then call tool.YIELD("reason").
+    - Next turn, read results from state["_tool_results"]["search"][key]["hits"].
+    - Always batch: queue everything you need before yielding.
 
     Citation discipline (non-negotiable)
     RLM-RS generates citations automatically from spans you read via doc[a:b].
 
     Therefore:
     - Before stating a factual claim, ensure you have read the supporting text by slicing the relevant span.
+    - Spans from doc.find and doc.regex are tagged scan:* and are excluded from citations. Follow up with doc[start:end] to create citeable spans.
     - If you did not read it from the documents, do not claim it as fact.
     - Prefer small, precise slices over giant dumps.
     - Do not use doc slices as the final answer. Use them as evidence and compose a complete response.
-    - When the question asks for specific fields, extract them explicitly (for example task_name, duration,
-      delegation_result) and compose the final answer from those fields.
 
     Recovery behavior
     If a tool fails or returns empty:
@@ -264,46 +203,17 @@ ROOT_PROMPT_SUBCALLS_DISABLED = textwrap.dedent(
     - BUDGET_SNAPSHOT: {{BUDGET_SNAPSHOT}}
     - LAST_STDOUT: {{LAST_STDOUT}}
     - LAST_ERROR (if any): {{LAST_ERROR}}
+    - STATE_SUMMARY (keys + counts only): {{STATE_SUMMARY}}
 
-    Recommended step pattern
-    - Step 1: Create state["work"]. Inspect corpus shape.
-    - Step 2: Identify candidate regions. Store spans and short excerpts.
-    - Step 3: Extract required fields into state["work"] using slicing and regex.
-    - Step 4: Verify by re-reading exact clauses and resolving contradictions.
-    - Step 5: Produce final answer via tool.FINAL(...).
-
-    Examples you may emulate (not mandatory)
-
-    Quick scan by keyword across docs:
-
-    ```repl
-    if "work" not in state:
-        state["work"] = {}
-
-    hits = []
-    terms = ["terminate", "termination", "notice period", "notice"]
-
-    for i in range(len(context)):
-        doc = context[i]
-        if hasattr(doc, "find"):
-            for term in terms:
-                for h in doc.find(term, max_hits=5):
-                    hits.append({"doc_index": i, "term": term, "start": h["start_char"], "end": h["end_char"]})
-
-    state["work"]["keyword_hits"] = hits[:50]
-    print(f"Found {len(hits)} hits (stored first 50).")
-    ```
-
-    Finalize:
-
-    ```repl
-    answer = state["work"].get("final_answer_text", "")
-    tool.FINAL(answer)
-    ```
+    Turn-minimizing step pattern (preferred)
+    - Prefer finishing in one step (tool.FINAL(...)).
+    - If you need tools: queue everything you need, tool.YIELD once, then finalize on the next turn. Use extra turns only for recovery.
 
     Proceed to answer the QUESTION using only environment inspection.
     """
-).strip()
+).strip().replace(
+    "__TOOL_SIGNATURES__", textwrap.indent(TOOL_SIGNATURE_TEXT, "  ")
+)
 
 
 def _format_json_value(value: JsonValue | None) -> str:
@@ -322,6 +232,16 @@ def _format_doc_lengths(doc_lengths_chars: Sequence[int]) -> str:
     return json.dumps(list(doc_lengths_chars), ensure_ascii=True)
 
 
+def root_prompt_version(*, subcalls_enabled: bool) -> str:
+    template = (
+        ROOT_PROMPT_SUBCALLS_ENABLED
+        if subcalls_enabled
+        else ROOT_PROMPT_SUBCALLS_DISABLED
+    )
+    digest = hashlib.sha256(template.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
 def build_root_prompt(
     *,
     question: str,
@@ -330,6 +250,7 @@ def build_root_prompt(
     budget_snapshot: JsonValue | None,
     last_stdout: str | None,
     last_error: str | None,
+    state_summary: JsonValue | None,
     subcalls_enabled: bool,
 ) -> str:
     template = (
@@ -344,6 +265,7 @@ def build_root_prompt(
         "{{BUDGET_SNAPSHOT}}": _format_json_value(budget_snapshot),
         "{{LAST_STDOUT}}": _format_optional_text(last_stdout),
         "{{LAST_ERROR}}": _format_optional_text(last_error),
+        "{{STATE_SUMMARY}}": _format_json_value(state_summary),
     }
     for token, value in replacements.items():
         template = template.replace(token, value)

@@ -3,9 +3,13 @@ from __future__ import annotations
 import math
 import re
 from typing import Sequence
+from urllib.parse import urlparse
 
-from langchain_openai import OpenAIEmbeddings as LangChainOpenAIEmbeddings
-from openai import APIStatusError, OpenAI
+from langchain_openai import (
+    AzureOpenAIEmbeddings as LangChainAzureOpenAIEmbeddings,
+    OpenAIEmbeddings as LangChainOpenAIEmbeddings,
+)
+from openai import APIStatusError
 from structlog.stdlib import BoundLogger
 
 from ragas import EvaluationDataset, SingleTurnSample, evaluate
@@ -19,9 +23,12 @@ from ragas.metrics._faithfulness import Faithfulness
 from rlm_rs.models import EvaluationJudgeMetrics, EvaluationJudgeScores, SpanLogEntry
 from rlm_rs.orchestrator.citations import DocumentText, merge_span_log
 from rlm_rs.orchestrator.providers import (
+    AZURE_OPENAI_PROVIDER_NAME,
     DEFAULT_OPENAI_BASE_URL,
     DEFAULT_OPENAI_MAX_RETRIES,
     DEFAULT_OPENAI_TIMEOUT_SECONDS,
+    OPENAI_PROVIDER_NAME,
+    build_openai_client,
 )
 from rlm_rs.settings import Settings
 
@@ -248,7 +255,7 @@ def _truncate_for_faithfulness(answer: str, *, max_chars: int = 1800) -> str:
     return prefix.rstrip()
 
 
-def _patch_openai_chat_completions(client: OpenAI) -> None:
+def _patch_openai_chat_completions(client: object) -> None:
     # Ragas uses instructor (JSON mode) under the hood, which currently sends `max_tokens`
     # for OpenAI chat completions. OpenAI reasoning models (o1/o3/...) and `gpt-5*` require
     # `max_completion_tokens` instead, otherwise the request returns 400 and Ragas silently
@@ -296,26 +303,18 @@ def _patch_openai_chat_completions(client: OpenAI) -> None:
     client.chat.completions.create = create  # type: ignore[assignment]
 
 
-def _build_openai_client(settings: Settings) -> OpenAI:
-    resolved_timeout = (
-        settings.openai_timeout_seconds
-        if settings.openai_timeout_seconds is not None
-        else DEFAULT_OPENAI_TIMEOUT_SECONDS
-    )
-    resolved_base_url = (
-        settings.openai_base_url.strip()
-        if isinstance(settings.openai_base_url, str) and settings.openai_base_url.strip()
-        else DEFAULT_OPENAI_BASE_URL
-    )
+def _build_openai_client(settings: Settings, *, provider: str) -> object:
     resolved_retries = (
         settings.openai_max_retries
         if settings.openai_max_retries is not None
         else DEFAULT_OPENAI_MAX_RETRIES
     )
-    client = OpenAI(
+    client = build_openai_client(
+        provider_name=provider,
         api_key=settings.openai_api_key,
-        base_url=resolved_base_url,
-        timeout=resolved_timeout,
+        base_url=settings.openai_base_url,
+        api_version=settings.openai_api_version,
+        timeout_seconds=settings.openai_timeout_seconds,
         max_retries=resolved_retries,
     )
     _patch_openai_chat_completions(client)
@@ -328,12 +327,12 @@ def _build_ragas_components(settings: Settings) -> tuple[object, object]:
     model = settings.eval_judge_model
     if not model:
         raise ValueError("EVAL_JUDGE_MODEL is required")
-    if provider != "openai":
-        raise ValueError("EVAL_JUDGE_PROVIDER must be openai")
+    if provider not in {OPENAI_PROVIDER_NAME, AZURE_OPENAI_PROVIDER_NAME}:
+        raise ValueError("EVAL_JUDGE_PROVIDER must be openai or azure_openai")
     if not settings.openai_api_key:
         raise ValueError("OPENAI_API_KEY is required for eval judge")
-    client = _build_openai_client(settings)
-    llm = llm_factory(model, provider=provider, client=client)
+    client = _build_openai_client(settings, provider=provider)
+    llm = llm_factory(model, provider=OPENAI_PROVIDER_NAME, client=client)
 
     # `AnswerRelevancy` expects a LangChain-style embeddings interface
     # (embed_query / embed_documents), not the ragas BaseRagasEmbedding interface.
@@ -342,23 +341,53 @@ def _build_ragas_components(settings: Settings) -> tuple[object, object]:
         if settings.openai_timeout_seconds is not None
         else DEFAULT_OPENAI_TIMEOUT_SECONDS
     )
-    resolved_base_url = (
-        settings.openai_base_url.strip()
-        if isinstance(settings.openai_base_url, str) and settings.openai_base_url.strip()
-        else DEFAULT_OPENAI_BASE_URL
-    )
     resolved_retries = (
         settings.openai_max_retries
         if settings.openai_max_retries is not None
         else DEFAULT_OPENAI_MAX_RETRIES
     )
-    embeddings = LangChainOpenAIEmbeddings(
-        model="text-embedding-3-small",
-        openai_api_key=settings.openai_api_key,
-        openai_api_base=resolved_base_url,
-        request_timeout=resolved_timeout,
-        max_retries=resolved_retries,
-    )
+    if provider == AZURE_OPENAI_PROVIDER_NAME:
+        resolved_base_url = (
+            settings.openai_base_url.strip()
+            if isinstance(settings.openai_base_url, str)
+            and settings.openai_base_url.strip()
+            else ""
+        )
+        if not resolved_base_url:
+            raise ValueError("OPENAI_BASE_URL or AZURE_OPENAI_ENDPOINT is required")
+        parsed = urlparse(resolved_base_url)
+        if "/openai" in (parsed.path or "").lower():
+            embeddings = LangChainAzureOpenAIEmbeddings(
+                model="text-embedding-3-small",
+                base_url=resolved_base_url,
+                api_key=settings.openai_api_key,
+                openai_api_version=settings.openai_api_version,
+                request_timeout=resolved_timeout,
+                max_retries=resolved_retries,
+            )
+        else:
+            embeddings = LangChainAzureOpenAIEmbeddings(
+                model="text-embedding-3-small",
+                azure_endpoint=resolved_base_url,
+                api_key=settings.openai_api_key,
+                openai_api_version=settings.openai_api_version,
+                request_timeout=resolved_timeout,
+                max_retries=resolved_retries,
+            )
+    else:
+        resolved_base_url = (
+            settings.openai_base_url.strip()
+            if isinstance(settings.openai_base_url, str)
+            and settings.openai_base_url.strip()
+            else DEFAULT_OPENAI_BASE_URL
+        )
+        embeddings = LangChainOpenAIEmbeddings(
+            model="text-embedding-3-small",
+            openai_api_key=settings.openai_api_key,
+            openai_api_base=resolved_base_url,
+            request_timeout=resolved_timeout,
+            max_retries=resolved_retries,
+        )
     return llm, embeddings
 
 

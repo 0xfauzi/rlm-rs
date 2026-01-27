@@ -18,6 +18,14 @@ The design follows the Recursive Language Models paper and the consolidated spec
 - Untrusted multi-tenant sandboxing against adversarial code.
 - A polished end-user UI (the UI in `ui/` is developer-facing).
 
+## Provider configuration
+
+RLM-RS supports OpenAI and Azure OpenAI through the same provider path.
+
+- OpenAI: `LLM_PROVIDER=openai` and `OPENAI_API_KEY`.
+- Azure OpenAI: `LLM_PROVIDER=azure_openai`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, and `OPENAI_API_VERSION`.
+- Model names should be deployment names when using Azure OpenAI.
+
 ## Architecture at a glance
 
 Component diagram:

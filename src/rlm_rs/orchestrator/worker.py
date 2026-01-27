@@ -35,7 +35,13 @@ from rlm_rs.models import (
 from rlm_rs.orchestrator import baseline as baseline_eval
 from rlm_rs.orchestrator import eval_judge
 from rlm_rs.orchestrator.citations import DocumentText, make_spanrefs
-from rlm_rs.orchestrator.providers import FakeLLMProvider, LLMProvider, OpenAIProvider
+from rlm_rs.orchestrator.providers import (
+    AZURE_OPENAI_PROVIDER_NAME,
+    OPENAI_PROVIDER_NAME,
+    FakeLLMProvider,
+    LLMProvider,
+    OpenAIProvider,
+)
 from rlm_rs.orchestrator.root_prompt import (
     build_root_prompt,
     parse_root_output,
@@ -1794,11 +1800,14 @@ def build_worker(
         endpoint_url=resolved.localstack_endpoint_url,
     )
     if provider is None:
-        if resolved.llm_provider and resolved.llm_provider != "fake":
-            if resolved.llm_provider == "openai":
+        provider_name = (resolved.llm_provider or "fake").strip().lower()
+        if provider_name and provider_name != "fake":
+            if provider_name in {OPENAI_PROVIDER_NAME, AZURE_OPENAI_PROVIDER_NAME}:
                 provider = OpenAIProvider(
+                    provider_name=provider_name,
                     api_key=resolved.openai_api_key,
                     base_url=resolved.openai_base_url,
+                    api_version=resolved.openai_api_version,
                     timeout_seconds=resolved.openai_timeout_seconds,
                     max_retries=resolved.openai_max_retries,
                     s3_client=s3_client,

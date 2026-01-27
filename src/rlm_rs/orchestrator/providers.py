@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from typing import Any, Iterable, Protocol
+from urllib.parse import urlparse
 
 from botocore.client import BaseClient
 from botocore.exceptions import ClientError
@@ -13,6 +14,7 @@ from openai import (
     APIConnectionError,
     APITimeoutError,
     APIStatusError,
+    AzureOpenAI,
     OpenAI,
     RateLimitError,
 )
@@ -136,6 +138,81 @@ DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_OPENAI_TIMEOUT_SECONDS = 30.0
 DEFAULT_OPENAI_MAX_RETRIES = 3
 OPENAI_PROVIDER_NAME = "openai"
+AZURE_OPENAI_PROVIDER_NAME = "azure_openai"
+
+
+def _normalize_provider_name(provider: str | None) -> str:
+    if not provider:
+        return OPENAI_PROVIDER_NAME
+    return provider.strip().lower()
+
+
+def _looks_like_azure_base_url(value: str) -> bool:
+    parsed = urlparse(value)
+    path = (parsed.path or "").lower()
+    return "/openai" in path
+
+
+def build_openai_client(
+    *,
+    provider_name: str,
+    api_key: str | None,
+    base_url: str | None,
+    api_version: str | None,
+    timeout_seconds: float | None,
+    max_retries: int | None,
+) -> Any:
+    resolved_timeout = (
+        timeout_seconds
+        if timeout_seconds is not None
+        else DEFAULT_OPENAI_TIMEOUT_SECONDS
+    )
+    resolved_retries = (
+        max_retries if max_retries is not None else DEFAULT_OPENAI_MAX_RETRIES
+    )
+    normalized_provider = _normalize_provider_name(provider_name)
+    if normalized_provider == AZURE_OPENAI_PROVIDER_NAME:
+        if not api_key:
+            raise ValueError(
+                "OPENAI_API_KEY or AZURE_OPENAI_API_KEY is required for azure_openai provider"
+            )
+        resolved_api_version = api_version.strip() if isinstance(api_version, str) else ""
+        if not resolved_api_version:
+            raise ValueError(
+                "OPENAI_API_VERSION or AZURE_OPENAI_API_VERSION is required for azure_openai provider"
+            )
+        resolved_base_url = base_url.strip() if isinstance(base_url, str) else ""
+        if not resolved_base_url:
+            raise ValueError(
+                "OPENAI_BASE_URL or AZURE_OPENAI_ENDPOINT is required for azure_openai provider"
+            )
+        if _looks_like_azure_base_url(resolved_base_url):
+            return AzureOpenAI(
+                api_key=api_key,
+                base_url=resolved_base_url,
+                api_version=resolved_api_version,
+                timeout=resolved_timeout,
+                max_retries=resolved_retries,
+            )
+        return AzureOpenAI(
+            api_key=api_key,
+            azure_endpoint=resolved_base_url,
+            api_version=resolved_api_version,
+            timeout=resolved_timeout,
+            max_retries=resolved_retries,
+        )
+
+    resolved_base_url = (
+        base_url.strip()
+        if isinstance(base_url, str) and base_url.strip()
+        else DEFAULT_OPENAI_BASE_URL
+    )
+    return OpenAI(
+        api_key=api_key,
+        base_url=resolved_base_url,
+        timeout=resolved_timeout,
+        max_retries=resolved_retries,
+    )
 
 
 def _utc_now() -> datetime:
@@ -378,8 +455,10 @@ class OpenAIProvider:
         self,
         *,
         client: Any | None = None,
+        provider_name: str = OPENAI_PROVIDER_NAME,
         api_key: str | None = None,
         base_url: str | None = None,
+        api_version: str | None = None,
         timeout_seconds: float | None = DEFAULT_OPENAI_TIMEOUT_SECONDS,
         max_retries: int | None = DEFAULT_OPENAI_MAX_RETRIES,
         s3_client: BaseClient | None = None,
@@ -391,20 +470,19 @@ class OpenAIProvider:
             timeout_seconds = DEFAULT_OPENAI_TIMEOUT_SECONDS
         if max_retries is None:
             max_retries = DEFAULT_OPENAI_MAX_RETRIES
-        resolved_base_url = (
-            base_url.strip()
-            if isinstance(base_url, str) and base_url.strip()
-            else DEFAULT_OPENAI_BASE_URL
-        )
+        normalized_provider = _normalize_provider_name(provider_name)
         if client is None:
-            client = OpenAI(
+            client = build_openai_client(
+                provider_name=normalized_provider,
                 api_key=api_key,
-                base_url=resolved_base_url,
-                timeout=timeout_seconds,
+                base_url=base_url,
+                api_version=api_version,
+                timeout_seconds=timeout_seconds,
                 max_retries=0,
             )
         self._client = client
         self._max_retries = max_retries
+        self._provider_name = normalized_provider
         self._logger = logger or get_logger("rlm_rs.llm")
         self._cache = None
         if s3_client is not None and s3_bucket is not None:
@@ -467,7 +545,7 @@ class OpenAIProvider:
         if tenant_id and self._cache is not None:
             cached = self._cache.get_text(
                 tenant_id=tenant_id,
-                provider=OPENAI_PROVIDER_NAME,
+                provider=self._provider_name,
                 model=model,
                 max_tokens=max_tokens,
                 temperature=effective_temperature,
@@ -484,7 +562,7 @@ class OpenAIProvider:
         if tenant_id and self._cache is not None:
             self._cache.put_text(
                 tenant_id=tenant_id,
-                provider=OPENAI_PROVIDER_NAME,
+                provider=self._provider_name,
                 model=model,
                 max_tokens=max_tokens,
                 temperature=effective_temperature,

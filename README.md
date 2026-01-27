@@ -1,6 +1,8 @@
 # RLM-RS
 
-RLM-RS is a reference implementation of the Recursive Language Model Runtime Service. It turns very large corpora into an external environment that a model can inspect with Python, while keeping provider calls and budgets in a managed orchestrator loop.
+RLM-RS is a reference implementation of Recursive Language Models (RLM), with considerations for deployment in an enterprise environment. It turns very large corpora into an external environment that a model can inspect with Python, while keeping provider calls and budgets in a managed orchestrator loop.
+
+Paper: https://arxiv.org/abs/2512.24601
 
 The design follows the Recursive Language Models paper and the consolidated spec in `docs/rls_spec.md`.
 

@@ -1,6 +1,8 @@
 # RLM-RS
 
-RLM-RS is a reference implementation of the Recursive Language Model Runtime Service. It turns very large corpora into an external environment that a model can inspect with Python, while keeping provider calls and budgets in a managed orchestrator loop.
+RLM-RS is a reference implementation of Recursive Language Models (RLM), with considerations for deployment in an enterprise environment. It turns very large corpora into an external environment that a model can inspect with Python, while keeping provider calls and budgets in a managed orchestrator loop.
+
+Paper: https://arxiv.org/abs/2512.24601
 
 The design follows the Recursive Language Models paper and the consolidated spec in `docs/rls_spec.md`.
 
@@ -17,6 +19,14 @@ The design follows the Recursive Language Models paper and the consolidated spec
 - A long-lived REPL server for arbitrary code.
 - Untrusted multi-tenant sandboxing against adversarial code.
 - A polished end-user UI (the UI in `ui/` is developer-facing).
+
+## Provider configuration
+
+RLM-RS supports OpenAI and Azure OpenAI through the same provider path.
+
+- OpenAI: `LLM_PROVIDER=openai` and `OPENAI_API_KEY`.
+- Azure OpenAI: `LLM_PROVIDER=azure_openai`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, and `OPENAI_API_VERSION`.
+- Model names should be deployment names when using Azure OpenAI.
 
 ## Architecture at a glance
 

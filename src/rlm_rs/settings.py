@@ -63,10 +63,16 @@ class Settings(BaseSettings):
         default=None, validation_alias=AliasChoices("LLM_PROVIDER_SECRET_ARN")
     )
     openai_api_key: str | None = Field(
-        default=None, validation_alias=AliasChoices("OPENAI_API_KEY")
+        default=None,
+        validation_alias=AliasChoices("OPENAI_API_KEY", "AZURE_OPENAI_API_KEY"),
     )
     openai_base_url: str | None = Field(
-        default=None, validation_alias=AliasChoices("OPENAI_BASE_URL")
+        default=None,
+        validation_alias=AliasChoices("OPENAI_BASE_URL", "AZURE_OPENAI_ENDPOINT"),
+    )
+    openai_api_version: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("OPENAI_API_VERSION", "AZURE_OPENAI_API_VERSION"),
     )
     openai_timeout_seconds: float | None = Field(
         default=None, validation_alias=AliasChoices("OPENAI_TIMEOUT_SECONDS")

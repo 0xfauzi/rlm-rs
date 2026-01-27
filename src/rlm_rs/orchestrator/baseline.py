@@ -6,15 +6,15 @@ from typing import Any, Literal, Mapping, Sequence, TypeAlias
 from urllib.parse import urlparse
 
 from botocore.client import BaseClient
-from openai import OpenAI
 
 from rlm_rs.settings import Settings
 from rlm_rs.storage import s3
 from rlm_rs.orchestrator.providers import (
-    DEFAULT_OPENAI_BASE_URL,
-    DEFAULT_OPENAI_TIMEOUT_SECONDS,
+    AZURE_OPENAI_PROVIDER_NAME,
+    OPENAI_PROVIDER_NAME,
     _uses_max_completion_tokens,
     _wants_max_completion_tokens,
+    build_openai_client,
 )
 
 BaselineSkipReason: TypeAlias = Literal[
@@ -143,21 +143,16 @@ def _output_limit_error(exc: Exception) -> bool:
     )
 
 
-def _build_openai_client(settings: Settings) -> OpenAI:
-    resolved_timeout = (
-        settings.openai_timeout_seconds
-        if settings.openai_timeout_seconds is not None
-        else DEFAULT_OPENAI_TIMEOUT_SECONDS
-    )
-    resolved_base_url = (
-        settings.openai_base_url.strip()
-        if isinstance(settings.openai_base_url, str) and settings.openai_base_url.strip()
-        else DEFAULT_OPENAI_BASE_URL
-    )
-    return OpenAI(
+def _build_openai_client(settings: Settings) -> Any:
+    provider_name = (settings.llm_provider or OPENAI_PROVIDER_NAME).strip().lower()
+    if provider_name != AZURE_OPENAI_PROVIDER_NAME:
+        provider_name = OPENAI_PROVIDER_NAME
+    return build_openai_client(
+        provider_name=provider_name,
         api_key=settings.openai_api_key,
-        base_url=resolved_base_url,
-        timeout=resolved_timeout,
+        base_url=settings.openai_base_url,
+        api_version=settings.openai_api_version,
+        timeout_seconds=settings.openai_timeout_seconds,
         max_retries=0,
     )
 

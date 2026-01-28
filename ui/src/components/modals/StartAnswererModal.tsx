@@ -3,7 +3,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ApiClient, ApiError } from "../../lib/api-client";
-import type { Budgets, ExecutionOptions, ModelsConfig } from "../../lib/types";
+import type {
+  Budgets,
+  ExecutionOptions,
+  ExecutionOutputMode,
+  ModelsConfig,
+} from "../../lib/types";
 import { recordExecution } from "../../lib/executions-store";
 import { useApp } from "../../contexts/AppContext";
 import { useToast } from "../../contexts/ToastContext";
@@ -20,6 +25,23 @@ const BUDGETS_EXAMPLE = `{
   "max_total_seconds": 120,
   "max_llm_subcalls": 5
 }`;
+
+const OUTPUT_MODE_OPTIONS: Array<{
+  value: ExecutionOutputMode;
+  label: string;
+  description: string;
+}> = [
+  {
+    value: "ANSWER",
+    label: "Answer",
+    description: "Return a final answer with citations.",
+  },
+  {
+    value: "CONTEXTS",
+    label: "Contexts",
+    description: "Return context snippets with citations only.",
+  },
+];
 
 function parseBudgets(raw: string): { value: Budgets | null; error: string | null } {
   if (!raw.trim()) {
@@ -69,6 +91,7 @@ export function StartAnswererModal({
   const [rootModel, setRootModel] = useState("");
   const [subModel, setSubModel] = useState("");
   const [budgetsText, setBudgetsText] = useState("");
+  const [outputMode, setOutputMode] = useState<ExecutionOutputMode>("ANSWER");
   const [returnTrace, setReturnTrace] = useState(false);
   const [redactTrace, setRedactTrace] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -103,8 +126,12 @@ export function StartAnswererModal({
         ? { root_model: rootModel.trim() || null, sub_model: subModel.trim() || null }
         : null;
     const options: ExecutionOptions | null =
-      returnTrace || redactTrace
-        ? { return_trace: returnTrace, redact_trace: redactTrace }
+      returnTrace || redactTrace || outputMode !== "ANSWER"
+        ? {
+            return_trace: returnTrace ? true : undefined,
+            redact_trace: redactTrace ? true : undefined,
+            output_mode: outputMode !== "ANSWER" ? outputMode : undefined,
+          }
         : null;
 
     try {
@@ -191,6 +218,38 @@ export function StartAnswererModal({
               />
             </label>
           </div>
+
+          <fieldset className="grid gap-2 text-sm text-slate-600">
+            <legend className="text-sm text-slate-600">Output Mode</legend>
+            <div className="grid gap-3 md:grid-cols-2">
+              {OUTPUT_MODE_OPTIONS.map((mode) => {
+                const isActive = outputMode === mode.value;
+                return (
+                  <label
+                    key={mode.value}
+                    className={`flex items-start gap-3 rounded-2xl border px-3 py-3 transition ${
+                      isActive
+                        ? "border-slate-900 bg-slate-50 text-slate-900"
+                        : "border-slate-200 text-slate-600"
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="output-mode"
+                      value={mode.value}
+                      checked={isActive}
+                      onChange={() => setOutputMode(mode.value)}
+                      className="mt-1 h-4 w-4 border-slate-300 text-slate-900"
+                    />
+                    <span className="grid gap-1">
+                      <span className="text-sm font-semibold">{mode.label}</span>
+                      <span className="text-xs text-slate-500">{mode.description}</span>
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
+          </fieldset>
 
           <label className="grid gap-2 text-sm text-slate-600">
             Budgets JSON

@@ -40,13 +40,13 @@ sequenceDiagram
   API-->>Client: 200 {status=READY,...}
 
   %% --- Answerer execution loop ---
-  Client->>API: POST /v1/sessions/{session_id}/executions (question, budgets, models)
+  Client->>API: POST /v1/sessions/{session_id}/executions (question, budgets, models, options.output_mode)
   API->>DDB: Create execution (RUNNING)
   API-->>Client: 202 {execution_id, status=RUNNING}
 
   loop Until FINAL or budgets exceeded
     Orch->>DDB: Load execution state + budgets snapshot
-    Orch->>LLM: Call ROOT model (system prompt + question + state summary + last stdout/error)
+    Orch->>LLM: Call ROOT model (system prompt + question + state summary + last stdout/error, output_mode)
     LLM-->>Orch: Root output (single ```repl code block)
 
     Orch->>Lambda: Invoke step(code, state, context_manifest, tool_results, limits)
@@ -65,10 +65,18 @@ sequenceDiagram
     Orch->>DDB: Accumulate span_log stats (counts, last turn)
 
     alt final.is_final == true
-      Orch->>S3: Load canonical text spans for checksum
-      Orch->>DDB: Read doc pointers + ids
-      Orch->>Orch: Merge spans + compute SpanRefs (checksums)
-      Orch->>DDB: Mark execution COMPLETED + store answer + citations + trace pointer
+      alt output_mode == CONTEXTS
+        Orch->>Orch: Filter span_log tags context or context:<suffix>
+        Orch->>S3: Load canonical text spans for checksum
+        Orch->>DDB: Read doc pointers + ids
+        Orch->>Orch: Build contexts + citations (answer null)
+        Orch->>DDB: Mark execution COMPLETED + store contexts (+ contexts_s3_uri) + citations + trace pointer
+      else output_mode == ANSWER
+        Orch->>S3: Load canonical text spans for checksum
+        Orch->>DDB: Read doc pointers + ids
+        Orch->>Orch: Merge spans + compute SpanRefs (checksums)
+        Orch->>DDB: Mark execution COMPLETED + store answer + citations + trace pointer
+      end
     else tool_requests present
       opt LLM subcalls
         Orch->>S3: Check LLM cache (hash(provider,model,temp,max_tokens,prompt))
@@ -103,3 +111,7 @@ sequenceDiagram
   API->>DDB: Read execution summary
   API-->>Client: 200 {status, answer, citations(SpanRefs), trace_s3_uri}
 ```
+
+Notes:
+- In output_mode=CONTEXTS, the root model still calls tool.FINAL, but the answer text is ignored.
+- Contexts are derived only from spans tagged context or context:<suffix> and returned as contexts or contexts_s3_uri.

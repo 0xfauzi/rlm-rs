@@ -228,7 +228,22 @@ def _count_input_tokens(
     prompt: str,
     model: str,
     client: Any,
+    prefer_responses: bool = False,
 ) -> int:
+    if prefer_responses:
+        try:
+            return _count_input_tokens_responses(
+                prompt=prompt,
+                model=model,
+                client=client,
+            )
+        except Exception as exc:  # noqa: BLE001
+            try:
+                return _count_input_tokens_chat(
+                    prompt=prompt, model=model, client=client
+                )
+            except Exception:  # noqa: BLE001
+                raise exc
     try:
         return _count_input_tokens_chat(prompt=prompt, model=model, client=client)
     except Exception as exc:  # noqa: BLE001
@@ -293,8 +308,17 @@ def prepare_baseline_prompt(
     document_text = build_baseline_prompt(documents, s3_client)
     prompt = build_baseline_answer_prompt(document_text, question)
     client = openai_client or _build_openai_client(settings)
+    provider_name = (settings.llm_provider or OPENAI_PROVIDER_NAME).strip().lower()
+    prefer_responses = (
+        settings.openai_use_responses_api and provider_name == OPENAI_PROVIDER_NAME
+    )
     try:
-        input_tokens = _count_input_tokens(prompt=prompt, model=model or "", client=client)
+        input_tokens = _count_input_tokens(
+            prompt=prompt,
+            model=model or "",
+            client=client,
+            prefer_responses=prefer_responses,
+        )
     except Exception as exc:  # noqa: BLE001
         exceeded, requested_tokens = _context_window_exceeded_error(exc)
         if exceeded:

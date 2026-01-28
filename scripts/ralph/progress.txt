@@ -11,13 +11,16 @@
 - BaseSettings fields with `validation_alias` are easiest to override via env vars (e.g., `S3_BUCKET`, `PARSER_SERVICE_URL`) instead of `Settings(field=...)`.
 - Runtime execution state starts at turn_index -1 so the first step persists turn_index 0.
 - Answerer executions currently persist an initial empty state at turn_index 0; orchestrator treats it as pre-step state.
-- LLM cache keys hash deterministic JSON of provider, model, temperature, max_tokens, and prompt_sha256 to `cache/{tenant_id}/llm/{sha256}.json`.
+- LLM cache keys hash deterministic JSON of provider, model, temperature, max_tokens, api_mode, reasoning_effort, verbosity, and prompt_sha256 to `cache/{tenant_id}/llm/{sha256}.json`.
 - Step execution timeouts use SIGALRM and only enforce when signal timers are available.
 - Worker containers select ingestion vs orchestrator via `WORKER_MODE`, with batch limits set by `INGESTION_BATCH_LIMIT` or `ORCHESTRATOR_BATCH_LIMIT` and sleep via `WORKER_POLL_INTERVAL_SECONDS`.
 - API rate limits are stored in `app.state.rate_limiter` from `RATE_LIMITS_JSON` using `max_requests` and `window_seconds` (optional per-tenant overrides).
 - Request size limits read `REQUEST_SIZE_LIMIT_BYTES` via `app.state.request_size_limit_bytes` and block oversized bodies in middleware.
 - Metrics are exposed at `/metrics` when `ENABLE_METRICS=true`.
 - When persisting float metrics to DynamoDB, run them through `_coerce_decimals` before `put_item`.
+- When sending DynamoDB items through JSON (tests or API payloads), use `state_store.normalize_json_value` to coerce Decimal values.
+- Contexts payloads use `storage/contexts.py` with the same inline size limit as state, offloading to `contexts_s3_uri` when too large.
+- Context items now use a schema with sequence_index, turn_index, span_index, tag, text, text_char_length, source_name, mime_type, and ref; citations are built 1:1 from the same refs.
 - `scripts/smoke_test.sh` writes JSON summaries to `SMOKE_OUTPUT_JSON`, and `KEEP_DOCKER=1` keeps LocalStack state across repeated runs.
 - MCP server wrapper lives in `rlm_rs.mcp` and reads `RLM_BASE_URL` and `RLM_API_KEY` from env.
 - Search tool resolution uses `SearchBackend`; disabled search records a spec-style error in tool results.
@@ -562,4 +565,68 @@
 - **Learnings:**
   - Patterns discovered: Vitest runs UI unit tests via `npm run test --prefix ui` with per-file environment overrides.
   - Gotchas encountered: Existing Node test files need migration to Vitest to avoid empty-suite failures.
+---
+## 2026-01-28 - US-001
+- What was implemented: Added execution output_mode with ANSWER/CONTEXTS defaults in models and API responses, persisted options to DynamoDB, and added unit coverage for output_mode handling.
+- Files changed: src/rlm_rs/models.py, src/rlm_rs/api/executions.py, tests/unit/test_api_executions.py, tests/unit/test_sandbox_runner.py, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q tests/unit -k execution_output_mode
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-28 - US-002
+- What was implemented: Added contexts-mode root prompt instructions, contexts-only finalization with tagged span filtering, and integration coverage with citation verification.
+- Files changed: src/rlm_rs/orchestrator/root_prompt.py, src/rlm_rs/orchestrator/worker.py, src/rlm_rs/storage/ddb.py, src/rlm_rs/finetune/traces.py, tests/integration/test_orchestrator_answerer.py, tests/integration/AGENTS.md, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q tests/integration -k answerer_contexts
+- **Learnings:**
+  - Patterns discovered: DynamoDB Decimal values need normalization (via state_store.normalize_json_value) before JSON encoding.
+  - Gotchas encountered: citations pulled from DDB include Decimal values that break JSON encoding without normalization.
+---
+## 2026-01-28 - US-003
+- What was implemented: Added contexts payload persistence with inline vs S3 offload, contexts retrieval endpoint, and unit coverage for offload roundtrip plus API access.
+- Files changed: src/rlm_rs/storage/contexts.py, src/rlm_rs/storage/ddb.py, src/rlm_rs/orchestrator/worker.py, src/rlm_rs/models.py, src/rlm_rs/api/executions.py, src/rlm_rs/storage/AGENTS.md, tests/unit/test_contexts_payload.py, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q tests/unit -k contexts_payload
+- **Learnings:**
+  - Patterns discovered: Contexts payloads offload through storage/contexts with contexts_s3_uri when exceeding the inline size limit.
+  - Gotchas encountered: none
+---
+## 2026-01-28 - US-004
+- What was implemented: Added ContextItem schema with sequence/turn/span metadata, updated contexts construction and validation, and aligned unit/integration coverage.
+- Files changed: src/rlm_rs/models.py, src/rlm_rs/orchestrator/citations.py, src/rlm_rs/orchestrator/worker.py, src/rlm_rs/storage/contexts.py, src/rlm_rs/api/executions.py, tests/unit/test_contexts_payload.py, tests/unit/test_context_schema.py, tests/integration/test_orchestrator_answerer.py, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q tests/unit -k context_schema
+- **Learnings:**
+  - Patterns discovered: Context items carry sequence_index, turn_index, span_index, tag, text, text_char_length, source_name, mime_type, and ref for 1:1 citation mapping.
+  - Gotchas encountered: none
+---
+## 2026-01-28 - US-005
+- What was implemented: Added turn_index to root REPL code log entries, exposed it in API and UI types, and added unit coverage for multi-turn ordering.
+- Files changed: src/rlm_rs/code_log.py, src/rlm_rs/orchestrator/worker.py, src/rlm_rs/models.py, src/rlm_rs/api/executions.py, ui/src/lib/types.ts, tests/unit/test_code_log_turn_index.py, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q tests/unit -k code_log_turn_index
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-28 - US-006
+- What was implemented: Added Answerer Output Mode selector (Answer vs Contexts), sent output_mode on create, and surfaced Contexts badges for Answerer executions; updated cache-key unit test to include api_mode.
+- Files changed: ui/src/components/modals/StartAnswererModal.tsx, ui/src/app/executions/ExecutionsPageClient.tsx, ui/src/lib/types.ts, tests/unit/test_openai_provider_cache.py, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q tests/unit; NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm test --prefix ui
+- **Learnings:**
+  - Patterns discovered: LLM cache keys include api_mode in the deterministic hash payload.
+  - Gotchas encountered: none
+---
+## 2026-01-28 - US-007
+- What was implemented: Added contexts-mode UI on execution detail with timeline, inspector, and S3-backed context fetch; hid answer/baseline/evaluation in contexts mode and surfaced repl code per turn.
+- Files changed: ui/src/app/executions/[execution_id]/page.tsx, ui/src/lib/api-client.ts, ui/src/lib/types.ts, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q tests/unit; NPM_CONFIG_CACHE=/tmp/npm-cache npm run typecheck --prefix ui; NPM_CONFIG_CACHE=/tmp/npm-cache npm test --prefix ui
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: none
+---
+## 2026-01-28 - US-008
+- What was implemented: Documented contexts output_mode behavior, context schema fields, and UI layout updates in specs.
+- Files changed: docs/rls_spec.md, docs/sequence.md, docs/ui_spec.md, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- Verification run (exact commands): UV_CACHE_DIR=/tmp/uv-cache uv run ruff check .; UV_CACHE_DIR=/tmp/uv-cache DDB_TABLE_PREFIX=rlm_20260128_1 uv run pytest -q
+- **Learnings:**
+  - Patterns discovered: none
+  - Gotchas encountered: LocalStack state required a unique DDB_TABLE_PREFIX to avoid conditional write collisions; .git is read-only in this environment, so git add and git commit failed.
 ---

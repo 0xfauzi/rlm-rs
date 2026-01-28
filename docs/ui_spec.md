@@ -129,6 +129,7 @@ Inputs:
 - Sub model (default from API settings)
 - Budgets JSON editor (optional)
 - Options:
+  - Output Mode selector (Answer, Contexts) default Answer.
   - Return trace (checkbox)
   - Redact trace (checkbox)
 
@@ -146,7 +147,7 @@ Left panel:
 - Total seconds
 - LLM subcalls
 
-Right panel:
+Right panel (output_mode=ANSWER):
 - Answer box
 - Citations list
   - `Doc <index> · <start>-<end> · <checksum>`
@@ -156,9 +157,19 @@ Right panel:
   - Turn timeline with status badges
   - Stdout, state, span log, tool requests, final, and error payloads
 
+Right panel (output_mode=CONTEXTS):
+- Context Timeline
+  - Items sorted by sequence_index and collapsed by default.
+  - Show sequence_index and turn_index in the row header.
+- Context Inspector
+  - Metadata: sequence_index, turn_index, span_index, tag, source_name, mime_type.
+  - SpanRef link with tenant_id, session_id, doc_id, doc_index, start_char, end_char, checksum.
+  - REPL code block for the same turn_index, with an empty state when code is unavailable.
+
 Behavior:
 - Poll every 2 seconds while RUNNING.
 - Stop on terminal status.
+- When contexts_s3_uri is present, load contexts via GET /v1/executions/{execution_id}/contexts before rendering the timeline.
 
 ## Screen: Runtime Execution (Multi-step)
 

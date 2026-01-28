@@ -29,6 +29,8 @@ These are **integration tests** that exercise multiple components together, typi
   - LocalStack state can persist across runs; if you see conditional write collisions, set `DDB_TABLE_PREFIX` to a unique value per run.
 - **Minimize timing flakiness.**
   - Prefer polling with deadlines over fixed sleeps.
+- **Normalize DynamoDB numerics before JSON.**
+  - DDB returns `Decimal` values - use `state_store.normalize_json_value` before sending JSON payloads in tests.
 - **Fail with actionable error messages.**
   - Integration failures can be hard to debug; make assertions descriptive.
 
@@ -38,4 +40,3 @@ These are **integration tests** that exercise multiple components together, typi
   - `docker compose up -d localstack localstack-init`
 - Run integration tests:
   - `uv run pytest -q tests/integration`
-

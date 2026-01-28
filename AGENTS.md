@@ -1,7 +1,7 @@
 # AGENTS
 
 This file is the local guide for coding agents working on RLM-RS.
-
+# DO NOT COMMIT TO GIT
 ## Project overview
 - RLM-RS implements the Recursive Language Model Runtime Service with API, orchestrator, ingestion, sandbox, parser, and storage components.
 - Core code lives under `src/rlm_rs`; tests are in `tests`; design references are in `docs`.

@@ -412,6 +412,8 @@ def update_execution_status(
     new_status: str,
     answer: str | None = None,
     citations: list[dict[str, JsonValue]] | None = None,
+    contexts: list[JsonValue] | None = None,
+    contexts_s3_uri: str | None = None,
     trace_s3_uri: str | None = None,
     budgets_consumed: dict[str, JsonValue] | None = None,
     completed_at: str | None = None,
@@ -428,6 +430,12 @@ def update_execution_status(
     if citations is not None:
         updates.append("citations = :citations")
         values[":citations"] = citations
+    if contexts is not None:
+        updates.append("contexts = :contexts")
+        values[":contexts"] = contexts
+    if contexts_s3_uri is not None:
+        updates.append("contexts_s3_uri = :contexts_s3_uri")
+        values[":contexts_s3_uri"] = contexts_s3_uri
     if trace_s3_uri is not None:
         updates.append("trace_s3_uri = :trace_s3_uri")
         values[":trace_s3_uri"] = trace_s3_uri

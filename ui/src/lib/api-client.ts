@@ -8,6 +8,7 @@ import {
   type CreateSessionResponse,
   type ErrorEnvelope,
   type EvaluationRecord,
+  type ExecutionContextsResponse,
   type ExecutionMode,
   type ExecutionStatus,
   type ExecutionStepHistoryResponse,
@@ -192,6 +193,10 @@ export class ApiClient {
 
   getExecution(id: string): Promise<ExecutionStatusResponse> {
     return this.request<ExecutionStatusResponse>(`/v1/executions/${id}`);
+  }
+
+  getExecutionContexts(id: string): Promise<ExecutionContextsResponse> {
+    return this.request<ExecutionContextsResponse>(`/v1/executions/${id}/contexts`);
   }
 
   getExecutionEvaluation(id: string): Promise<EvaluationRecord> {

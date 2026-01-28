@@ -17,6 +17,7 @@ import type {
   BudgetsConsumed,
   CodeLogEntry,
   CodeLogSource,
+  ContextItem,
   EvaluationRecord,
   ExecutionStepSnapshot,
   ExecutionStatus,
@@ -422,7 +423,13 @@ export default function ExecutionDetailPage() {
     SUB: true,
     TOOL: true,
   });
+  const [contexts, setContexts] = useState<ContextItem[]>([]);
+  const [isLoadingContexts, setIsLoadingContexts] = useState(false);
+  const [contextsError, setContextsError] = useState<Error | null>(null);
+  const [selectedContextIndex, setSelectedContextIndex] = useState<number | null>(null);
+  const [contextTab, setContextTab] = useState<"citation" | "repl" | "text">("citation");
   const codeCursorRef = useRef<string | null>(null);
+  const contextsS3Ref = useRef<string | null>(null);
 
   const refreshExecution = useCallback(async () => {
     if (!executionId) {
@@ -514,6 +521,26 @@ export default function ExecutionDetailPage() {
     [apiClient, executionId],
   );
 
+  const refreshContexts = useCallback(async () => {
+    if (!executionId) {
+      return;
+    }
+    setIsLoadingContexts(true);
+    try {
+      const payload = await apiClient.getExecutionContexts(executionId);
+      setContexts(payload.contexts ?? []);
+      setContextsError(null);
+    } catch (err) {
+      if (err instanceof Error) {
+        setContextsError(err);
+      } else {
+        setContextsError(new Error("Failed to load contexts."));
+      }
+    } finally {
+      setIsLoadingContexts(false);
+    }
+  }, [apiClient, executionId]);
+
   const refreshEvaluation = useCallback(async () => {
     if (!executionId) {
       return;
@@ -564,6 +591,15 @@ export default function ExecutionDetailPage() {
     setEvaluationError(null);
     setEvaluationNotFound(false);
     setIsLoadingEvaluation(false);
+  }, [executionId]);
+
+  useEffect(() => {
+    setContexts([]);
+    setContextsError(null);
+    setIsLoadingContexts(false);
+    setSelectedContextIndex(null);
+    setContextTab("citation");
+    contextsS3Ref.current = null;
   }, [executionId]);
 
   useEffect(() => {
@@ -620,14 +656,48 @@ export default function ExecutionDetailPage() {
     if (!executionId) {
       return;
     }
+    if (execution?.output_mode !== "CONTEXTS") {
+      setContexts([]);
+      setContextsError(null);
+      setIsLoadingContexts(false);
+      contextsS3Ref.current = null;
+      return;
+    }
+    if (execution?.contexts_s3_uri) {
+      if (contextsS3Ref.current === execution.contexts_s3_uri) {
+        return;
+      }
+      contextsS3Ref.current = execution.contexts_s3_uri;
+      void refreshContexts();
+      return;
+    }
+    contextsS3Ref.current = null;
+    setContexts(execution?.contexts ?? []);
+    setContextsError(null);
+    setIsLoadingContexts(false);
+  }, [
+    executionId,
+    execution?.output_mode,
+    execution?.contexts_s3_uri,
+    execution?.contexts,
+    refreshContexts,
+  ]);
+
+  useEffect(() => {
+    if (!executionId) {
+      return;
+    }
     if (execution?.mode === "RUNTIME") {
+      return;
+    }
+    if (execution?.output_mode === "CONTEXTS") {
       return;
     }
     if (execution?.status !== "COMPLETED") {
       return;
     }
     void refreshEvaluation();
-  }, [executionId, execution?.mode, execution?.status, refreshEvaluation]);
+  }, [executionId, execution?.mode, execution?.output_mode, execution?.status, refreshEvaluation]);
 
   const handleCopy = useCallback(
     async (value: string) => {
@@ -643,8 +713,10 @@ export default function ExecutionDetailPage() {
 
   const isRunning = execution?.status === "RUNNING";
   const isRuntime = execution?.mode === "RUNTIME";
+  const isContextsMode = execution?.output_mode === "CONTEXTS";
   const isEvaluationRunning =
     !isRuntime &&
+    !isContextsMode &&
     execution?.status === "COMPLETED" &&
     !evaluationError &&
     (evaluationNotFound || !evaluation || evaluation?.baseline_status === "RUNNING");
@@ -652,6 +724,32 @@ export default function ExecutionDetailPage() {
     () => codeEntries.filter((entry) => codeFilters[entry.source]),
     [codeEntries, codeFilters],
   );
+  const orderedContexts = useMemo(() => {
+    const sorted = [...contexts];
+    sorted.sort((a, b) => a.sequence_index - b.sequence_index);
+    return sorted;
+  }, [contexts]);
+  const selectedContext = useMemo(
+    () =>
+      selectedContextIndex === null
+        ? null
+        : orderedContexts.find((context) => context.sequence_index === selectedContextIndex) ??
+          null,
+    [orderedContexts, selectedContextIndex],
+  );
+  const contextReplEntries = useMemo(() => {
+    if (!selectedContext) {
+      return [];
+    }
+    return codeEntries
+      .filter(
+        (entry) =>
+          entry.kind === "REPL" &&
+          typeof entry.turn_index === "number" &&
+          entry.turn_index === selectedContext.turn_index,
+      )
+      .sort((a, b) => a.sequence - b.sequence);
+  }, [codeEntries, selectedContext]);
 
   const handleCancel = useCallback(async () => {
     if (!executionId || !isRunning || isCancelling) {
@@ -683,7 +781,11 @@ export default function ExecutionDetailPage() {
       if (!executionId || isRecomputingEvaluation) {
         return;
       }
-      if (execution?.mode === "RUNTIME" || execution?.status !== "COMPLETED") {
+      if (
+        execution?.mode === "RUNTIME" ||
+        execution?.output_mode === "CONTEXTS" ||
+        execution?.status !== "COMPLETED"
+      ) {
         return;
       }
       setIsRecomputingEvaluation(true);
@@ -718,6 +820,10 @@ export default function ExecutionDetailPage() {
     setCodeFilters((previous) => ({ ...previous, [source]: !previous[source] }));
   }, []);
 
+  const handleSelectContext = useCallback((sequenceIndex: number) => {
+    setSelectedContextIndex(sequenceIndex);
+  }, []);
+
   const budgetsRequested: Budgets | null | undefined = execution?.budgets_requested;
   const budgetsConsumed: BudgetsConsumed | null | undefined = execution?.budgets_consumed;
 
@@ -732,6 +838,7 @@ export default function ExecutionDetailPage() {
 
   const shouldPollEvaluation =
     !isRuntime &&
+    !isContextsMode &&
     execution?.status === "COMPLETED" &&
     !evaluationError &&
     (evaluationNotFound || !evaluation || evaluation?.baseline_status === "RUNNING");
@@ -746,9 +853,81 @@ export default function ExecutionDetailPage() {
     return () => window.clearInterval(interval);
   }, [refreshEvaluation, shouldPollEvaluation]);
 
+  useEffect(() => {
+    if (!isContextsMode) {
+      setSelectedContextIndex(null);
+      return;
+    }
+    if (orderedContexts.length === 0) {
+      setSelectedContextIndex(null);
+      return;
+    }
+    setSelectedContextIndex((previous) => {
+      if (
+        previous !== null &&
+        orderedContexts.some((context) => context.sequence_index === previous)
+      ) {
+        return previous;
+      }
+      return orderedContexts[0]?.sequence_index ?? null;
+    });
+  }, [isContextsMode, orderedContexts]);
+
+  useEffect(() => {
+    if (!selectedContext) {
+      setContextTab("citation");
+    }
+  }, [selectedContext]);
+
   const status = execution?.status as ExecutionStatus | undefined;
   const showWaiting = status === "RUNNING" || status === "PENDING";
   const showError = status && status !== "COMPLETED" && !showWaiting;
+  const citationsCard = (
+    <CollapsibleCard
+      title="Citations"
+      right={
+        <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">
+          {citations.length} refs
+        </span>
+      }
+      defaultOpen={false}
+    >
+      <div className="space-y-3">
+        {citations.length === 0 ? (
+          <EmptyState
+            title="No citations yet"
+            description="Citations will appear after the execution finishes."
+          />
+        ) : null}
+        {citations.map((citation, index) => (
+          <div
+            key={`${citation.checksum}-${index}`}
+            className="rounded-2xl border border-slate-200 p-4"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className="text-xs uppercase tracking-[0.25em] text-slate-400">
+                  Doc {citation.doc_index}
+                </p>
+                <p className="text-sm font-semibold text-slate-700">
+                  {citation.start_char} - {citation.end_char}
+                </p>
+                <p className="mt-1 text-xs text-slate-500">
+                  {truncateChecksum(citation.checksum)}
+                </p>
+              </div>
+              <Link
+                href={buildCitationLink(citation)}
+                className="rounded-full border border-slate-200 px-3 py-2 text-xs font-semibold uppercase tracking-[0.2em] text-slate-600"
+              >
+                Inspect
+              </Link>
+            </div>
+          </div>
+        ))}
+      </div>
+    </CollapsibleCard>
+  );
 
   return (
     <div className="space-y-6">
@@ -901,123 +1080,125 @@ export default function ExecutionDetailPage() {
                 </div>
               </CollapsibleCard>
 
-              <div className="grid items-start gap-6 lg:grid-cols-2">
-                <CollapsibleCard
-                  title="Answer"
-                  right={
-                    <span className="text-xs uppercase tracking-[0.25em] text-slate-400">
-                      {execution.status}
-                    </span>
-                  }
-                  defaultOpen
-                >
-                  <div className="min-h-[120px] rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
-                    {showWaiting ? (
-                      <div className="flex items-center gap-2 text-slate-500">
-                        <span className="h-2 w-2 animate-pulse rounded-full bg-amber-500" />
-                        <span>Waiting for answer...</span>
-                      </div>
-                    ) : null}
-                    {showError ? (
-                      <div className="text-rose-600">
-                        Execution ended with status: {execution.status}
-                      </div>
-                    ) : null}
-                    {!showWaiting && !showError ? (
-                      <p className="whitespace-pre-wrap text-slate-700">
-                        {answer || "No answer available."}
-                      </p>
-                    ) : null}
-                  </div>
-                </CollapsibleCard>
-
-                {isLoadingEvaluation ? (
-                  <SkeletonCard lines={4} />
-                ) : isEvaluationRunning ? (
-                  <EvaluationPendingCard
-                    title="Baseline"
-                    description="Baseline evaluation is running."
-                  />
-                ) : (
+              {!isContextsMode ? (
+                <div className="grid items-start gap-6 lg:grid-cols-2">
                   <CollapsibleCard
-                    title="Baseline"
+                    title="Answer"
                     right={
-                      evaluation ? (
-                        <span
-                          className={`rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-[0.25em] ${baselineStatusStyle}`}
-                        >
-                          {evaluation.baseline_status}
-                        </span>
-                      ) : null
+                      <span className="text-xs uppercase tracking-[0.25em] text-slate-400">
+                        {execution.status}
+                      </span>
                     }
-                    defaultOpen={false}
+                    defaultOpen
                   >
-                    <div className="space-y-4">
-                      {isRuntime ? (
-                        <EmptyState
-                          title="Not supported"
-                          description="Baseline evaluations are not available for runtime executions."
-                        />
-                      ) : evaluationError ? (
-                        <ErrorPanel
-                          error={evaluationError}
-                          title="Baseline evaluation failed"
-                          onRetry={() => void refreshEvaluation()}
-                        />
-                      ) : evaluationNotFound ? (
-                        <EmptyState
-                          title="Not available yet"
-                          description="Baseline evaluation has not been created yet."
-                        />
-                      ) : evaluation ? (
-                        <>
-                          <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600">
-                            <div className="flex justify-between">
-                              <span className="text-xs uppercase tracking-[0.2em] text-slate-400">
-                                Input tokens
-                              </span>
-                              <span className="font-semibold text-slate-700">
-                                {formatNumber(evaluation.baseline_input_tokens)}
-                              </span>
-                            </div>
-                            <div className="mt-2 flex justify-between">
-                              <span className="text-xs uppercase tracking-[0.2em] text-slate-400">
-                                Context window
-                              </span>
-                              <span className="font-semibold text-slate-700">
-                                {formatNumber(evaluation.baseline_context_window)}
-                              </span>
-                            </div>
-                            {evaluation.baseline_status === "SKIPPED" ? (
-                              <div className="mt-2 text-xs text-slate-500">
-                                Skip reason: {evaluation.baseline_skip_reason ?? "-"}
-                              </div>
-                            ) : null}
-                          </div>
-                          <div className="min-h-[120px] rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
-                            {evaluation.baseline_answer ? (
-                              <p className="whitespace-pre-wrap text-slate-700">
-                                {evaluation.baseline_answer}
-                              </p>
-                            ) : (
-                              <span className="text-slate-500">
-                                No baseline answer available.
-                              </span>
-                            )}
-                          </div>
-                        </>
-                      ) : (
-                        <EmptyState
-                          title="Not available yet"
-                          description="Baseline evaluation has not been created yet."
-                        />
-                      )}
+                    <div className="min-h-[120px] rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
+                      {showWaiting ? (
+                        <div className="flex items-center gap-2 text-slate-500">
+                          <span className="h-2 w-2 animate-pulse rounded-full bg-amber-500" />
+                          <span>Waiting for answer...</span>
+                        </div>
+                      ) : null}
+                      {showError ? (
+                        <div className="text-rose-600">
+                          Execution ended with status: {execution.status}
+                        </div>
+                      ) : null}
+                      {!showWaiting && !showError ? (
+                        <p className="whitespace-pre-wrap text-slate-700">
+                          {answer || "No answer available."}
+                        </p>
+                      ) : null}
                     </div>
                   </CollapsibleCard>
-                )}
-              </div>
 
-              {!isRuntime ? (
+                  {isLoadingEvaluation ? (
+                    <SkeletonCard lines={4} />
+                  ) : isEvaluationRunning ? (
+                    <EvaluationPendingCard
+                      title="Baseline"
+                      description="Baseline evaluation is running."
+                    />
+                  ) : (
+                    <CollapsibleCard
+                      title="Baseline"
+                      right={
+                        evaluation ? (
+                          <span
+                            className={`rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-[0.25em] ${baselineStatusStyle}`}
+                          >
+                            {evaluation.baseline_status}
+                          </span>
+                        ) : null
+                      }
+                      defaultOpen={false}
+                    >
+                      <div className="space-y-4">
+                        {isRuntime ? (
+                          <EmptyState
+                            title="Not supported"
+                            description="Baseline evaluations are not available for runtime executions."
+                          />
+                        ) : evaluationError ? (
+                          <ErrorPanel
+                            error={evaluationError}
+                            title="Baseline evaluation failed"
+                            onRetry={() => void refreshEvaluation()}
+                          />
+                        ) : evaluationNotFound ? (
+                          <EmptyState
+                            title="Not available yet"
+                            description="Baseline evaluation has not been created yet."
+                          />
+                        ) : evaluation ? (
+                          <>
+                            <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600">
+                              <div className="flex justify-between">
+                                <span className="text-xs uppercase tracking-[0.2em] text-slate-400">
+                                  Input tokens
+                                </span>
+                                <span className="font-semibold text-slate-700">
+                                  {formatNumber(evaluation.baseline_input_tokens)}
+                                </span>
+                              </div>
+                              <div className="mt-2 flex justify-between">
+                                <span className="text-xs uppercase tracking-[0.2em] text-slate-400">
+                                  Context window
+                                </span>
+                                <span className="font-semibold text-slate-700">
+                                  {formatNumber(evaluation.baseline_context_window)}
+                                </span>
+                              </div>
+                              {evaluation.baseline_status === "SKIPPED" ? (
+                                <div className="mt-2 text-xs text-slate-500">
+                                  Skip reason: {evaluation.baseline_skip_reason ?? "-"}
+                                </div>
+                              ) : null}
+                            </div>
+                            <div className="min-h-[120px] rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
+                              {evaluation.baseline_answer ? (
+                                <p className="whitespace-pre-wrap text-slate-700">
+                                  {evaluation.baseline_answer}
+                                </p>
+                              ) : (
+                                <span className="text-slate-500">
+                                  No baseline answer available.
+                                </span>
+                              )}
+                            </div>
+                          </>
+                        ) : (
+                          <EmptyState
+                            title="Not available yet"
+                            description="Baseline evaluation has not been created yet."
+                          />
+                        )}
+                      </div>
+                    </CollapsibleCard>
+                  )}
+                </div>
+              ) : null}
+
+              {!isRuntime && !isContextsMode ? (
                 isLoadingEvaluation ? (
                   <SkeletonCard lines={3} />
                 ) : isEvaluationRunning ? (
@@ -1108,51 +1289,313 @@ export default function ExecutionDetailPage() {
                 )
               ) : null}
 
-              <CollapsibleCard
-                title="Citations"
-                right={
-                  <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">
-                    {citations.length} refs
-                  </span>
-                }
-                defaultOpen={false}
-              >
-                <div className="space-y-3">
-                  {citations.length === 0 ? (
-                    <EmptyState
-                      title="No citations yet"
-                      description="Citations will appear after the execution finishes."
-                    />
-                  ) : null}
-                  {citations.map((citation, index) => (
-                    <div
-                      key={`${citation.checksum}-${index}`}
-                      className="rounded-2xl border border-slate-200 p-4"
-                    >
-                      <div className="flex flex-wrap items-center justify-between gap-3">
-                        <div>
-                          <p className="text-xs uppercase tracking-[0.25em] text-slate-400">
-                            Doc {citation.doc_index}
-                          </p>
-                          <p className="text-sm font-semibold text-slate-700">
-                            {citation.start_char} - {citation.end_char}
-                          </p>
-                          <p className="mt-1 text-xs text-slate-500">
-                            {truncateChecksum(citation.checksum)}
-                          </p>
-                        </div>
-                        <Link
-                          href={buildCitationLink(citation)}
-                          className="rounded-full border border-slate-200 px-3 py-2 text-xs font-semibold uppercase tracking-[0.2em] text-slate-600"
-                        >
-                          Inspect
-                        </Link>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </CollapsibleCard>
+              {!isContextsMode ? citationsCard : null}
             </section>
+
+            {isContextsMode ? (
+              <div className="lg:col-span-2">
+                <CollapsibleCard
+                  title="Context Timeline"
+                  subtitle="Tagged spans captured by the answerer."
+                  right={
+                    <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">
+                      {orderedContexts.length} contexts
+                    </span>
+                  }
+                  defaultOpen
+                >
+                  <div className="space-y-5">
+                    {isLoadingContexts ? <SkeletonCard lines={4} /> : null}
+                    {!isLoadingContexts && contextsError ? (
+                      <ErrorPanel error={contextsError} onRetry={() => void refreshContexts()} />
+                    ) : null}
+                    {!isLoadingContexts &&
+                    !contextsError &&
+                    orderedContexts.length === 0 ? (
+                      <EmptyState
+                        title="No contexts yet"
+                        description="Contexts appear after the execution finishes."
+                      />
+                    ) : null}
+                    {!isLoadingContexts && !contextsError && orderedContexts.length > 0 ? (
+                      <>
+                        <div className="grid items-start gap-6 lg:grid-cols-[minmax(260px,360px)_minmax(520px,1fr)] xl:grid-cols-[minmax(280px,380px)_minmax(640px,1.2fr)]">
+                          <div className="self-start lg:sticky lg:top-6">
+                            <div className="max-h-[70vh] overflow-y-auto pr-2">
+                              <div className="space-y-2">
+                                {orderedContexts.map((context) => {
+                                  const isSelected =
+                                    selectedContext?.sequence_index === context.sequence_index;
+                                  return (
+                                    <button
+                                      key={`${context.sequence_index}-${context.ref.checksum}`}
+                                      type="button"
+                                      onClick={() => handleSelectContext(context.sequence_index)}
+                                      title={`${context.tag} · ${context.source_name}`}
+                                      className={`w-full rounded-2xl border px-3 py-2 text-left text-xs font-semibold tracking-[0.2em] ${
+                                        isSelected
+                                          ? "border-slate-900 bg-slate-900 text-white"
+                                          : "border-slate-200 bg-white text-slate-600"
+                                      }`}
+                                    >
+                                      <span className="block text-[10px] uppercase tracking-[0.2em]">
+                                        #{context.sequence_index} · T{context.turn_index}
+                                      </span>
+                                      <span className="mt-1 block whitespace-normal text-xs font-semibold">
+                                        {context.tag}
+                                      </span>
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="space-y-4 lg:max-h-[70vh] lg:overflow-y-auto lg:pr-2">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div>
+                                <p className="text-sm font-semibold text-slate-900">
+                                  Context Detail
+                                </p>
+                                <p className="text-xs text-slate-500">
+                                  Metadata, citation, text, and repl code for the selected context.
+                                </p>
+                              </div>
+                              {selectedContext ? (
+                                <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">
+                                  #{selectedContext.sequence_index}
+                                </span>
+                              ) : null}
+                            </div>
+
+                            {!selectedContext ? (
+                              <EmptyState
+                                title="Select a context"
+                                description="Choose a context from the timeline to inspect details."
+                              />
+                            ) : (
+                              <>
+                                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                                  <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
+                                    Metadata
+                                  </p>
+                                  <div className="mt-3 space-y-2 text-sm text-slate-600">
+                                    <div className="flex justify-between gap-3">
+                                      <span className="text-xs uppercase tracking-[0.2em] text-slate-400">
+                                        Sequence
+                                      </span>
+                                      <span className="font-semibold text-slate-700">
+                                        {selectedContext.sequence_index}
+                                      </span>
+                                    </div>
+                                    <div className="flex justify-between gap-3">
+                                      <span className="text-xs uppercase tracking-[0.2em] text-slate-400">
+                                        Turn
+                                      </span>
+                                      <span className="font-semibold text-slate-700">
+                                        {selectedContext.turn_index}
+                                      </span>
+                                    </div>
+                                    <div className="flex justify-between gap-3">
+                                      <span className="text-xs uppercase tracking-[0.2em] text-slate-400">
+                                        Span
+                                      </span>
+                                      <span className="font-semibold text-slate-700">
+                                        {selectedContext.span_index}
+                                      </span>
+                                    </div>
+                                    <div className="flex justify-between gap-3">
+                                      <span className="text-xs uppercase tracking-[0.2em] text-slate-400">
+                                        Tag
+                                      </span>
+                                      <span className="break-words font-semibold text-slate-700">
+                                        {selectedContext.tag}
+                                      </span>
+                                    </div>
+                                    <div className="flex justify-between gap-3">
+                                      <span className="text-xs uppercase tracking-[0.2em] text-slate-400">
+                                        Source
+                                      </span>
+                                      <span className="break-words font-semibold text-slate-700">
+                                        {selectedContext.source_name}
+                                      </span>
+                                    </div>
+                                    <div className="flex justify-between gap-3">
+                                      <span className="text-xs uppercase tracking-[0.2em] text-slate-400">
+                                        Mime type
+                                      </span>
+                                      <span className="font-semibold text-slate-700">
+                                        {selectedContext.mime_type}
+                                      </span>
+                                    </div>
+                                    <div className="flex justify-between gap-3">
+                                      <span className="text-xs uppercase tracking-[0.2em] text-slate-400">
+                                        Text chars
+                                      </span>
+                                      <span className="font-semibold text-slate-700">
+                                        {selectedContext.text_char_length}
+                                      </span>
+                                    </div>
+                                  </div>
+                                </div>
+
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => setContextTab("citation")}
+                                    className={`rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] ${
+                                      contextTab === "citation"
+                                        ? "border-slate-900 bg-slate-900 text-white"
+                                        : "border-slate-200 text-slate-500"
+                                    }`}
+                                  >
+                                    Citation
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setContextTab("text")}
+                                    className={`rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] ${
+                                      contextTab === "text"
+                                        ? "border-slate-900 bg-slate-900 text-white"
+                                        : "border-slate-200 text-slate-500"
+                                    }`}
+                                  >
+                                    Text
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setContextTab("repl")}
+                                    className={`rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] ${
+                                      contextTab === "repl"
+                                        ? "border-slate-900 bg-slate-900 text-white"
+                                        : "border-slate-200 text-slate-500"
+                                    }`}
+                                  >
+                                    Repl code
+                                  </button>
+                                </div>
+
+                                <div className="space-y-4">
+                                  {contextTab === "citation" ? (
+                                    <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                                      <div className="flex items-center justify-between">
+                                        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
+                                          Citation
+                                        </p>
+                                        <Link
+                                          href={buildCitationLink(selectedContext.ref)}
+                                          className="rounded-full border border-slate-200 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] text-slate-500"
+                                        >
+                                          Inspect
+                                        </Link>
+                                      </div>
+                                      <div className="mt-3 space-y-2 text-sm text-slate-600">
+                                        <div className="flex justify-between gap-3">
+                                          <span className="text-xs uppercase tracking-[0.2em] text-slate-400">
+                                            Doc id
+                                          </span>
+                                          <span className="font-semibold text-slate-700">
+                                            {selectedContext.ref.doc_id}
+                                          </span>
+                                        </div>
+                                        <div className="flex justify-between gap-3">
+                                          <span className="text-xs uppercase tracking-[0.2em] text-slate-400">
+                                            Doc index
+                                          </span>
+                                          <span className="font-semibold text-slate-700">
+                                            {selectedContext.ref.doc_index}
+                                          </span>
+                                        </div>
+                                        <div className="flex justify-between gap-3">
+                                          <span className="text-xs uppercase tracking-[0.2em] text-slate-400">
+                                            Char range
+                                          </span>
+                                          <span className="font-semibold text-slate-700">
+                                            {selectedContext.ref.start_char} to{" "}
+                                            {selectedContext.ref.end_char}
+                                          </span>
+                                        </div>
+                                        <div className="flex justify-between gap-3">
+                                          <span className="text-xs uppercase tracking-[0.2em] text-slate-400">
+                                            Checksum
+                                          </span>
+                                          <span className="font-semibold text-slate-700 break-all">
+                                            {selectedContext.ref.checksum}
+                                          </span>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  ) : null}
+
+                                  {contextTab === "text" ? (
+                                    <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                                      <div className="text-sm text-slate-700">
+                                        <p className="whitespace-pre-wrap">
+                                          {selectedContext.text}
+                                        </p>
+                                      </div>
+                                    </div>
+                                  ) : null}
+
+                                  {contextTab === "repl" ? (
+                                    <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                                      <div className="flex items-center justify-between">
+                                        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
+                                          Repl code - Turn {selectedContext.turn_index}
+                                        </p>
+                                        <span className="text-xs uppercase tracking-[0.2em] text-slate-400">
+                                          {contextReplEntries.length} entries
+                                        </span>
+                                      </div>
+                                      <div className="mt-3 space-y-3">
+                                        {contextReplEntries.length === 0 ? (
+                                          <EmptyState
+                                            title="No repl code"
+                                            description="Repl code is not available for this turn."
+                                          />
+                                        ) : (
+                                          contextReplEntries.map((entry) => (
+                                            <div
+                                              key={`${entry.sequence}-${entry.source}`}
+                                              className="space-y-2"
+                                            >
+                                              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                                                <span className="rounded-full bg-slate-100 px-2 py-1 text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">
+                                                  {CODE_SOURCE_LABELS[entry.source]}
+                                                </span>
+                                                {entry.model_name ? (
+                                                  <span className="text-xs text-slate-500">
+                                                    model {entry.model_name}
+                                                  </span>
+                                                ) : null}
+                                              </div>
+                                              <CodeBlock
+                                                language="python"
+                                                content={
+                                                  typeof entry.content === "string"
+                                                    ? entry.content
+                                                    : formatJson(entry.content)
+                                                }
+                                              />
+                                            </div>
+                                          ))
+                                        )}
+                                      </div>
+                                    </div>
+                                  ) : null}
+                                </div>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      </>
+                    ) : null}
+                  </div>
+                </CollapsibleCard>
+              </div>
+            ) : null}
+
+            {isContextsMode ? <div className="lg:col-span-2">{citationsCard}</div> : null}
           </div>
 
           <CollapsibleCard

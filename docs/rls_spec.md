@@ -284,6 +284,15 @@ state["_tool_results"]["llm"]["key"]["text"]
 ### 7.4 Citation rule
 Citations are produced from runtime span logging. Before asserting a fact, the model should read supporting text via doc slicing so the runtime logs the span.
 
+### 7.5 Contexts output mode (output_mode=CONTEXTS)
+Answerer executions accept options.output_mode with values ANSWER or CONTEXTS.
+When output_mode=CONTEXTS:
+- The orchestrator appends contexts-mode instructions to the root prompt.
+- The model marks returnable spans by calling doc.slice(start, end, tag="context") or doc.slice(start, end, tag="context:<suffix>").
+- Only spans whose tag is exactly context or starts with context: are returned as contexts.
+- tool.FINAL(...) still ends the execution, but its answer text is ignored.
+- Responses include contexts inline or a contexts_s3_uri pointer. The answer field is null and citations are derived 1:1 from the same spans.
+
 ---
 
 ## 8. Context model (ContextView / DocView)
@@ -841,7 +850,8 @@ Request:
     "return_trace": false,
     "redact_trace": false,
     "synchronous": false,
-    "synchronous_timeout_seconds": 30
+    "synchronous_timeout_seconds": 30,
+    "output_mode": "ANSWER"
   }
 }
 ```
@@ -859,6 +869,7 @@ Response (completed):
 ```json
 {
   "execution_id": "exec_...",
+  "output_mode": "ANSWER",
   "status": "COMPLETED",
   "answer": "...",
   "citations": [
@@ -876,6 +887,84 @@ Response (completed):
   "trace_s3_uri": "s3://.../traces/.../exec_....json.gz"
 }
 ```
+
+Response (completed, output_mode=CONTEXTS):
+
+```json
+{
+  "execution_id": "exec_...",
+  "output_mode": "CONTEXTS",
+  "status": "COMPLETED",
+  "answer": null,
+  "contexts": [
+    {
+      "sequence_index": 0,
+      "turn_index": 1,
+      "span_index": 0,
+      "tag": "context:summary",
+      "text": "example text",
+      "text_char_length": 12,
+      "source_name": "contract.pdf",
+      "mime_type": "application/pdf",
+      "ref": {
+        "tenant_id": "...",
+        "session_id": "...",
+        "doc_id": "...",
+        "doc_index": 0,
+        "start_char": 10,
+        "end_char": 22,
+        "checksum": "sha256:..."
+      }
+    }
+  ],
+  "contexts_s3_uri": null,
+  "citations": [
+    {
+      "tenant_id": "...",
+      "session_id": "...",
+      "doc_id": "...",
+      "doc_index": 0,
+      "start_char": 10,
+      "end_char": 22,
+      "checksum": "sha256:..."
+    }
+  ],
+  "budgets_consumed": {"turns": 1, "llm_subcalls": 0, "total_seconds": 1},
+  "trace_s3_uri": "s3://.../traces/.../exec_....json.gz"
+}
+```
+
+### 16.3.1 Context item schema (contexts output)
+
+Each context item is derived from a span_log entry tagged for context return.
+
+```json
+{
+  "sequence_index": 0,
+  "turn_index": 1,
+  "span_index": 0,
+  "tag": "context",
+  "text": "example text",
+  "text_char_length": 12,
+  "source_name": "contract.pdf",
+  "mime_type": "application/pdf",
+  "ref": {
+    "tenant_id": "...",
+    "session_id": "...",
+    "doc_id": "...",
+    "doc_index": 0,
+    "start_char": 10,
+    "end_char": 22,
+    "checksum": "sha256:..."
+  }
+}
+```
+
+Notes:
+- sequence_index is the global discovery order across all turns and is contiguous starting at 0.
+- turn_index is the step index where the span was logged.
+- span_index is the in-turn span order for that step.
+- tag is the span tag, for example context or context:<suffix>.
 
 GET /v1/executions/{execution_id}/steps
 

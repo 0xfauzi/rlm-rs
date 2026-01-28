@@ -1,6 +1,7 @@
 "use client";
 
-import { useRouter } from "next/navigation";
+import Link from "next/link";
+import { usePathname, useRouter } from "next/navigation";
 import { useApp } from "../../contexts/AppContext";
 
 const STATUS_LABEL = {
@@ -8,6 +9,19 @@ const STATUS_LABEL = {
   offline: "Offline",
   unknown: "Offline",
 } as const;
+
+const NAV_LINKS = [
+  { label: "Sessions", href: "/sessions" },
+  { label: "Executions", href: "/executions" },
+  { label: "Debug", href: "/debug" },
+];
+
+function isActive(pathname: string, href: string) {
+  if (href === "/") {
+    return pathname === href;
+  }
+  return pathname === href || pathname.startsWith(`${href}/`);
+}
 
 function HealthBadge({
   label,
@@ -37,7 +51,8 @@ function HealthBadge({
 
 export function TopBar({ onToggleSidebar }: { onToggleSidebar: () => void }) {
   const router = useRouter();
-  const { apiHealth, localstackHealth, config } = useApp();
+  const pathname = usePathname();
+  const { apiHealth, localstackHealth, config, runningExecutionsCount } = useApp();
 
   const goToDebug = () => {
     router.push("/debug");
@@ -45,7 +60,7 @@ export function TopBar({ onToggleSidebar }: { onToggleSidebar: () => void }) {
 
   return (
     <header className="sticky top-0 z-30 flex h-16 items-center justify-between border-b border-slate-200 bg-white/80 px-4 backdrop-blur md:px-6">
-      <div className="flex flex-wrap items-center justify-end gap-3">
+      <div className="flex flex-wrap items-center gap-3">
         <button
           type="button"
           onClick={onToggleSidebar}
@@ -63,6 +78,28 @@ export function TopBar({ onToggleSidebar }: { onToggleSidebar: () => void }) {
           <span className="text-xs text-slate-400">Recursive Language Model</span>
         </div>
       </div>
+      <nav className="hidden flex-1 items-center justify-center gap-2 md:flex">
+        {NAV_LINKS.map((link) => {
+          const active = pathname ? isActive(pathname, link.href) : false;
+          const activeClass = active
+            ? "border-slate-900 bg-slate-900 text-white"
+            : "border-slate-200 bg-white text-slate-600 hover:border-slate-400";
+          return (
+            <Link
+              key={link.href}
+              href={link.href}
+              className={`flex items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold uppercase tracking-[0.25em] transition ${activeClass}`}
+            >
+              <span>{link.label}</span>
+              {link.label === "Executions" && runningExecutionsCount > 0 ? (
+                <span className="rounded-full bg-amber-200 px-2 py-0.5 text-xs font-semibold text-amber-800">
+                  {runningExecutionsCount}
+                </span>
+              ) : null}
+            </Link>
+          );
+        })}
+      </nav>
       <div className="flex items-center gap-3">
         <HealthBadge label="API" status={apiHealth} onClick={goToDebug} />
         <HealthBadge label="LocalStack" status={localstackHealth} onClick={goToDebug} />

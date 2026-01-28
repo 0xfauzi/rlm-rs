@@ -22,6 +22,7 @@ from rlm_rs.models import (
     BudgetsConsumed,
     ContextDocument,
     ContextManifest,
+    ContextItem,
     LimitsSnapshot,
     LLMToolResult,
     ModelsConfig,
@@ -34,7 +35,11 @@ from rlm_rs.models import (
 )
 from rlm_rs.orchestrator import baseline as baseline_eval
 from rlm_rs.orchestrator import eval_judge
-from rlm_rs.orchestrator.citations import DocumentText, make_spanrefs
+from rlm_rs.orchestrator.citations import (
+    DocumentText,
+    build_span_ref,
+    make_spanrefs,
+)
 from rlm_rs.orchestrator.providers import (
     AZURE_OPENAI_PROVIDER_NAME,
     OPENAI_PROVIDER_NAME,
@@ -58,6 +63,7 @@ from rlm_rs.search.backends import (
 from rlm_rs.settings import Settings
 from rlm_rs.sandbox.runner import SandboxRunner, build_sandbox_runner
 from rlm_rs.sandbox.tool_api import build_tool_schema
+from rlm_rs.storage import contexts as contexts_store
 from rlm_rs.storage import ddb, s3, state as state_store
 from rlm_rs.storage.ddb import DdbTableNames, build_ddb_resource, build_table_names
 from rlm_rs.storage.s3 import build_s3_client
@@ -199,6 +205,15 @@ def _resolve_budgets(
     if settings.default_budgets_json is None:
         return None
     return Budgets.model_validate(settings.default_budgets_json)
+
+
+def _resolve_output_mode(execution_item: Mapping[str, Any]) -> str:
+    options = execution_item.get("options")
+    if isinstance(options, dict):
+        output_mode = options.get("output_mode")
+        if output_mode in ("ANSWER", "CONTEXTS"):
+            return output_mode
+    return "ANSWER"
 
 
 def _limits_from_budgets(budgets: Budgets | None) -> LimitsSnapshot | None:
@@ -436,6 +451,10 @@ def _load_documents_text(
         text_s3_uri = item.get("text_s3_uri")
         if not text_s3_uri:
             raise ValueError("Missing text_s3_uri")
+        source_name = item.get("source_name")
+        mime_type = item.get("mime_type")
+        if source_name is None or mime_type is None:
+            raise ValueError("Missing source_name or mime_type")
         bucket, key = _split_s3_uri(str(text_s3_uri))
         payload = s3.get_bytes(s3_client, bucket, key)
         documents.append(
@@ -443,9 +462,78 @@ def _load_documents_text(
                 doc_id=str(item["doc_id"]),
                 doc_index=int(item["doc_index"]),
                 text=payload.decode("utf-8"),
+                source_name=str(source_name),
+                mime_type=str(mime_type),
             )
         )
     return documents
+
+
+def _is_context_tag(tag: str | None) -> bool:
+    if tag == "context":
+        return True
+    return bool(tag) and tag.startswith("context:")
+
+
+@dataclass(frozen=True)
+class ContextSpanEntry:
+    turn_index: int
+    span_index: int
+    span: SpanLogEntry
+
+
+def _build_contexts_and_citations(
+    *,
+    span_log: Sequence[ContextSpanEntry],
+    documents: Sequence[DocumentText],
+    tenant_id: str,
+    session_id: str,
+) -> tuple[list[dict[str, JsonValue]], list[dict[str, JsonValue]]]:
+    doc_lookup = {doc.doc_index: doc for doc in documents}
+    contexts: list[dict[str, JsonValue]] = []
+    citations_payload: list[dict[str, JsonValue]] = []
+    seen: set[tuple[int, int, int]] = set()
+    sequence_index = 0
+    for span in span_log:
+        entry = span.span
+        if not _is_context_tag(entry.tag):
+            continue
+        key = (entry.doc_index, entry.start_char, entry.end_char)
+        if key in seen:
+            continue
+        seen.add(key)
+        document = doc_lookup.get(entry.doc_index)
+        if document is None:
+            raise KeyError(f"Missing document for doc_index={entry.doc_index}")
+        start_char = int(entry.start_char)
+        end_char = int(entry.end_char)
+        if end_char <= start_char:
+            continue
+        text = document.text[start_char:end_char]
+        ref = build_span_ref(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            doc_id=document.doc_id,
+            doc_index=document.doc_index,
+            start_char=start_char,
+            end_char=end_char,
+            text=document.text,
+        )
+        context_item = ContextItem(
+            sequence_index=sequence_index,
+            turn_index=span.turn_index,
+            span_index=span.span_index,
+            tag=str(entry.tag),
+            text=text,
+            text_char_length=len(text),
+            source_name=str(document.source_name),
+            mime_type=str(document.mime_type),
+            ref=ref,
+        )
+        contexts.append(context_item.model_dump(exclude_none=True))
+        citations_payload.append(ref.model_dump(exclude_none=True))
+        sequence_index += 1
+    return contexts, citations_payload
 
 
 def _pre_step_state(state_item: Mapping[str, Any]) -> bool:
@@ -541,6 +629,45 @@ def _build_state_summary(state: JsonValue | None, *, max_keys: int = 50) -> Json
             summary["tool_search_keys"] = _limit([str(k) for k in search_bucket.keys()])
 
     return summary
+
+
+def _normalize_blank_lines(lines: list[str]) -> str:
+    cleaned: list[str] = []
+    prev_blank = False
+    for line in lines:
+        is_blank = not line.strip()
+        if is_blank and prev_blank:
+            continue
+        cleaned.append(line)
+        prev_blank = is_blank
+    while cleaned and not cleaned[0].strip():
+        cleaned.pop(0)
+    while cleaned and not cleaned[-1].strip():
+        cleaned.pop()
+    return "\n".join(cleaned)
+
+
+def _sanitize_final_answer(answer: str) -> str:
+    if not answer:
+        return answer
+    lines = answer.splitlines()
+    header_prefix = "supporting points mentioned in the document"
+    header_index = None
+    for idx, line in enumerate(lines):
+        if line.strip().lower().startswith(header_prefix):
+            header_index = idx
+            break
+    if header_index is None:
+        return answer
+    end = header_index + 1
+    while end < len(lines):
+        stripped = lines[end].strip()
+        if stripped.startswith(("-", "•")) or not stripped:
+            end += 1
+            continue
+        break
+    new_lines = lines[:header_index] + lines[end:]
+    return _normalize_blank_lines(new_lines)
 
 
 def _resolve_tool_requests(
@@ -817,6 +944,7 @@ class OrchestratorWorker:
         trace_collector: TraceCollector | None,
         answer: str | None = None,
         citations: list[dict[str, JsonValue]] | None = None,
+        contexts: list[JsonValue] | None = None,
         duration_ms: int | None = None,
     ) -> None:
         budgets_consumed = None
@@ -876,6 +1004,19 @@ class OrchestratorWorker:
                         error=str(exc),
                     )
 
+        contexts_payload = contexts
+        contexts_s3_uri: str | None = None
+        if contexts is not None:
+            contexts_record = contexts_store.persist_contexts_payload(
+                contexts=contexts,
+                tenant_id=str(execution_item.get("tenant_id")),
+                execution_id=str(execution_item.get("execution_id")),
+                s3_client=self.s3_client,
+                bucket=self.settings.s3_bucket,
+            )
+            contexts_payload = contexts_record.contexts_json
+            contexts_s3_uri = contexts_record.contexts_s3_uri
+
         ddb.update_execution_status(
             executions_table,
             session_id=str(execution_item.get("session_id")),
@@ -884,6 +1025,8 @@ class OrchestratorWorker:
             new_status=status,
             answer=answer,
             citations=citations,
+            contexts=contexts_payload,
+            contexts_s3_uri=contexts_s3_uri,
             trace_s3_uri=trace_s3_uri,
             budgets_consumed=budgets_consumed,
             completed_at=completed_at,
@@ -953,6 +1096,7 @@ class OrchestratorWorker:
 
         models = _resolve_models(execution_item, session_item, self.settings)
         budgets = _resolve_budgets(execution_item, session_item, self.settings)
+        output_mode = _resolve_output_mode(execution_item)
         if models is None or not models.root_model:
             self._finalize_execution(
                 executions_table,
@@ -1051,6 +1195,7 @@ class OrchestratorWorker:
         last_stdout = state_item.get("stdout") or ""
         last_error = _format_step_error(state_item.get("error"))
         span_log: list[SpanLogEntry] = []
+        context_span_log: list[ContextSpanEntry] = []
         execution_start = time.monotonic()
         limits = _limits_from_budgets(budgets)
         enable_search = bool(
@@ -1114,8 +1259,12 @@ class OrchestratorWorker:
                 "last_error": last_error,
                 "state_summary": state_summary,
                 "subcalls_enabled": subcalls_enabled,
+                "output_mode": output_mode,
             }
-            prompt_version = root_prompt_version(subcalls_enabled=subcalls_enabled)
+            prompt_version = root_prompt_version(
+                subcalls_enabled=subcalls_enabled,
+                output_mode=output_mode,
+            )
             prompt_start = time.perf_counter()
             prompt = build_root_prompt(
                 question=question,
@@ -1126,6 +1275,7 @@ class OrchestratorWorker:
                 last_error=last_error,
                 state_summary=state_summary,
                 subcalls_enabled=subcalls_enabled,
+                output_mode=output_mode,
             )
             turn_timings["prompt_build_ms"] = _elapsed_ms(prompt_start)
             trace_collector.start_turn(
@@ -1151,12 +1301,29 @@ class OrchestratorWorker:
                 return True
 
             root_call_start = time.perf_counter()
+            if self.logger is not None:
+                self.logger.info(
+                    "root_call_start",
+                    execution_id=execution_id,
+                    turn_index=turn_index,
+                    model=root_model,
+                    prompt_chars=prompt_len,
+                )
             root_output = self.provider.complete_root(
                 prompt,
                 root_model,
                 tenant_id=tenant_id,
             )
             turn_timings["root_call_ms"] = _elapsed_ms(root_call_start)
+            if self.logger is not None:
+                self.logger.info(
+                    "root_call_complete",
+                    execution_id=execution_id,
+                    turn_index=turn_index,
+                    model=root_model,
+                    output_chars=len(root_output),
+                    duration_ms=turn_timings["root_call_ms"],
+                )
             tracker.record_prompt(prompt_len)
             parse_start = time.perf_counter()
             try:
@@ -1189,6 +1356,7 @@ class OrchestratorWorker:
                         source="ROOT",
                         model_name=root_model,
                         content=code,
+                        turn_index=turn_index,
                     )
                 ]
             )
@@ -1216,6 +1384,14 @@ class OrchestratorWorker:
             turn_timings["sandbox_ms"] = _elapsed_ms(sandbox_start)
             if result.tool_requests:
                 code_logger.write(code_log.build_tool_request_entries(result.tool_requests))
+            for span_index, span in enumerate(result.span_log):
+                context_span_log.append(
+                    ContextSpanEntry(
+                        turn_index=turn_index,
+                        span_index=span_index,
+                        span=span,
+                    )
+                )
             span_log.extend(result.span_log)
             tracker.record_turn()
 
@@ -1312,8 +1488,57 @@ class OrchestratorWorker:
                 return True
 
             if result.final and result.final.is_final:
+                if output_mode == "CONTEXTS":
+                    contexts_payload: list[dict[str, JsonValue]] = []
+                    citations_payload: list[dict[str, JsonValue]] = []
+                    context_spans = [
+                        entry for entry in context_span_log if _is_context_tag(entry.span.tag)
+                    ]
+                    if not context_spans and self.logger is not None:
+                        self.logger.warning(
+                            "contexts_missing_no_tagged_spans",
+                            execution_id=execution_id,
+                            span_count=len(span_log),
+                        )
+                    try:
+                        documents_text = _load_documents_text(documents, self.s3_client)
+                        if context_spans:
+                            contexts_payload, citations_payload = _build_contexts_and_citations(
+                                span_log=context_span_log,
+                                documents=documents_text,
+                                tenant_id=tenant_id,
+                                session_id=session_id,
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        if self.logger is not None:
+                            self.logger.warning(
+                                "contexts_build_failed",
+                                execution_id=execution_id,
+                                error=str(exc),
+                                span_count=len(span_log),
+                                context_span_count=len(context_spans),
+                            )
+                        contexts_payload = []
+                        citations_payload = []
+                    self._finalize_execution(
+                        executions_table,
+                        evaluations_table,
+                        execution_item=execution_item,
+                        session_item=session_item,
+                        documents=documents,
+                        status="COMPLETED",
+                        tracker=tracker,
+                        trace_collector=trace_collector,
+                        answer=None,
+                        citations=citations_payload,
+                        contexts=contexts_payload,
+                        duration_ms=self._duration_ms(execution_start),
+                    )
+                    return True
+
+                answer_text = _sanitize_final_answer(result.final.answer or "")
                 documents_text: list[DocumentText] = []
-                citations_payload: list[dict[str, JsonValue]] = []
+                citations_payload = []
                 citeable_spans = [
                     span for span in span_log if not (span.tag or "").startswith("scan:")
                 ]
@@ -1354,7 +1579,7 @@ class OrchestratorWorker:
                     status="COMPLETED",
                     tracker=tracker,
                     trace_collector=trace_collector,
-                    answer=result.final.answer or "",
+                    answer=answer_text,
                     citations=citations_payload,
                     duration_ms=self._duration_ms(execution_start),
                 )
@@ -1365,7 +1590,7 @@ class OrchestratorWorker:
                     execution_id=execution_id,
                     tenant_id=tenant_id,
                     question=question,
-                    answer=result.final.answer or "",
+                    answer=answer_text,
                     models=models,
                     documents=documents,
                     span_log=span_log,
@@ -1788,6 +2013,7 @@ def build_worker(
     provider: LLMProvider | None = None,
 ) -> OrchestratorWorker:
     resolved = settings or Settings()
+    logger = get_logger("rlm_rs.orchestrator")
     if not resolved.s3_bucket:
         raise ValueError("s3_bucket is required for orchestrator")
     ddb_resource = build_ddb_resource(
@@ -1803,6 +2029,15 @@ def build_worker(
         provider_name = (resolved.llm_provider or "fake").strip().lower()
         if provider_name and provider_name != "fake":
             if provider_name in {OPENAI_PROVIDER_NAME, AZURE_OPENAI_PROVIDER_NAME}:
+                use_responses_api = (
+                    bool(resolved.openai_use_responses_api)
+                    and provider_name == OPENAI_PROVIDER_NAME
+                )
+                if resolved.openai_use_responses_api and not use_responses_api:
+                    logger.warning(
+                        "responses_api_ignored_for_azure",
+                        note="Azure uses chat completions with current SDK; OPENAI_USE_RESPONSES_API applies only to openai provider",
+                    )
                 provider = OpenAIProvider(
                     provider_name=provider_name,
                     api_key=resolved.openai_api_key,
@@ -1812,6 +2047,9 @@ def build_worker(
                     max_retries=resolved.openai_max_retries,
                     s3_client=s3_client,
                     s3_bucket=resolved.s3_bucket,
+                    use_responses_api=use_responses_api,
+                    subcall_reasoning_effort=resolved.subcall_reasoning_effort,
+                    subcall_min_completion_tokens=resolved.subcall_min_completion_tokens,
                 )
             else:
                 raise ValueError("LLM provider is not configured")
@@ -1831,5 +2069,5 @@ def build_worker(
         s3_client=s3_client,
         provider=provider,
         search_backend=search_backend,
-        logger=get_logger("rlm_rs.orchestrator"),
+        logger=logger,
     )

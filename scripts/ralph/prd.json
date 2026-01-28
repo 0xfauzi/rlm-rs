@@ -1,16 +1,16 @@
 {
-  "branchName": "ralph/rlm-rs-v1",
+  "branchName": "ralph/answerer-contexts-mode",
   "userStories": [
     {
       "id": "US-001",
-      "title": "Bootstrap uv monorepo skeleton",
+      "title": "Add output_mode option to Answerer executions in API and models",
       "acceptanceCriteria": [
-        "Project uses uv with pyproject.toml and a Python 3.11+ src/ layout package named rlm_rs.",
-        "uv --version runs successfully.",
-        "uv sync completes without errors.",
-        "uv run python -c \"import rlm_rs; print('ok')\" prints ok.",
+        "ExecutionOptions includes output_mode with allowed values ANSWER and CONTEXTS, defaulting to ANSWER when omitted.",
+        "CreateExecutionRequest accepts options.output_mode and the execution record persists the value in DynamoDB.",
+        "ExecutionStatusResponse and ExecutionListItem include output_mode reflecting the stored value.",
+        "Existing executions without output_mode return output_mode=ANSWER in API responses.",
         "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
+        "Tests pass: uv run pytest -q tests/unit -k execution_output_mode exits 0."
       ],
       "priority": 1,
       "passes": true,
@@ -18,12 +18,18 @@
     },
     {
       "id": "US-002",
-      "title": "Define core Pydantic schemas",
+      "title": "Implement contexts output mode in root prompt and orchestrator finalization",
       "acceptanceCriteria": [
-        "src/rlm_rs/models.py defines Pydantic v2 models for budgets/limits, tool request envelopes (llm and search), step I/O (StepEvent, StepResult), span logs/refs, and the HTTP request/response bodies for the /v1 endpoints in the plan.",
-        "uv run python -c \"from rlm_rs.models import StepEvent, StepResult; print(StepEvent.model_json_schema()['title'], StepResult.model_json_schema()['title'])\" prints StepEvent StepResult.",
+        "Root prompt builder selects a contexts template when output_mode=CONTEXTS and instructs the model to tag returnable spans using tag values of context or context:<suffix>.",
+        "Orchestrator finalization in contexts mode ignores tool.FINAL answer text and produces contexts only from span_log entries whose tag is exactly context or starts with context:.",
+        "Contexts are ordered by global discovery sequence using turn_index then in turn span order, and include full canonical text slices.",
+        "Duplicate spans with identical doc_index,start_char,end_char are de-duplicated keeping the earliest sequence and preserving the remaining order.",
+        "Citations are generated from the same context spans and are 1:1 with contexts by SpanRef checksum.",
+        "Execution completes with answer null and no evaluation record is created when output_mode=CONTEXTS.",
+        "Integration test uses FakeLLMProvider to tag context spans with both context and context:foo, includes a non-context tag, and verifies only the matching tags are included in contexts.",
+        "Integration test verifies status COMPLETED, contexts present, and citations verify via POST /v1/citations/verify.",
         "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q tests/unit -k models exits 0."
+        "Tests pass: uv run pytest -q tests/integration -k answerer_contexts exits 0."
       ],
       "priority": 2,
       "passes": true,
@@ -31,12 +37,14 @@
     },
     {
       "id": "US-003",
-      "title": "Implement spec error envelope helpers",
+      "title": "Persist and retrieve contexts payloads with S3 offload",
       "acceptanceCriteria": [
-        "src/rlm_rs/errors.py defines the standard spec error envelope and error codes plus raise_http_error(code, message, details).",
-        "Error envelope is JSON serializable and preserves code, message, and details in unit tests.",
+        "Contexts payloads are stored inline on the execution item when under the existing inline payload limit, otherwise written to S3 with contexts_s3_uri populated.",
+        "GET /v1/executions/{execution_id} returns contexts when inline and returns contexts_s3_uri when offloaded, with answer explicitly null in contexts mode.",
+        "GET /v1/executions/{execution_id}/contexts returns the full contexts payload regardless of storage location and enforces tenant access.",
+        "Unit test forces offload by injecting a small inline size limit and verifies the contexts payload round trips from S3 unchanged.",
         "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
+        "Tests pass: uv run pytest -q tests/unit -k contexts_payload exits 0."
       ],
       "priority": 3,
       "passes": true,
@@ -44,13 +52,15 @@
     },
     {
       "id": "US-004",
-      "title": "Add settings and structured logging",
+      "title": "Define and expose context item schema for clients",
       "acceptanceCriteria": [
-        "src/rlm_rs/settings.py provides env-driven config for AWS region, DDB prefix, S3 bucket, LocalStack endpoint override, parser URL, orchestrator-only provider settings, budgets/models blobs, and feature flags enable_search, enable_mcp, enable_trace_redaction.",
-        "src/rlm_rs/logging.py configures JSON logs via structlog with request_id, tenant_id, session_id, execution_id and optional OpenTelemetry that safely no-ops when unset.",
-        "uv run python -c \"from rlm_rs.settings import Settings; s=Settings(); print('loaded', bool(s.aws_region))\" prints loaded and a boolean.",
+        "Context item schema includes: sequence_index, turn_index, span_index, tag, text, text_char_length, source_name, mime_type, and ref (SpanRef) with tenant_id, session_id, doc_id, doc_index, start_char, end_char, checksum.",
+        "Contexts include full text sections with no truncation; collapsed rendering is handled by the UI only.",
+        "sequence_index is global discovery order across all turns and is contiguous starting at 0.",
+        "turn_index and span_index are present on every context item and match the originating step and in turn order.",
+        "API responses use the context schema for both inline contexts and /contexts endpoint.",
         "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
+        "Tests pass: uv run pytest -q tests/unit -k context_schema exits 0."
       ],
       "priority": 4,
       "passes": true,
@@ -58,15 +68,13 @@
     },
     {
       "id": "US-005",
-      "title": "Add Docker Compose LocalStack baseline",
+      "title": "Include turn_index on root repl code log entries",
       "acceptanceCriteria": [
-        "compose.yaml includes a localstack service configured for s3,dynamodb and documents endpoint override env vars for services.",
-        "scripts/localstack_init.sh creates the S3 bucket and DynamoDB tables rlm_sessions, rlm_documents, rlm_executions, rlm_execution_state, rlm_api_keys, rlm_audit_log.",
-        "docker compose up -d localstack succeeds.",
-        "docker compose exec -T localstack awslocal s3 ls succeeds.",
-        "docker compose exec -T localstack awslocal dynamodb list-tables shows all required tables.",
+        "Root repl code log entries include turn_index and it is persisted in the code_log table.",
+        "Code log API response includes turn_index for repl entries and UI types include the field.",
+        "Unit test asserts turn_index is present and increases for multi turn answerer executions.",
         "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
+        "Tests pass: uv run pytest -q tests/unit -k code_log_turn_index exits 0."
       ],
       "priority": 5,
       "passes": true,
@@ -74,12 +82,14 @@
     },
     {
       "id": "US-006",
-      "title": "Implement S3 storage helpers",
+      "title": "Add Answerer output mode selection in UI and surface it in executions list",
       "acceptanceCriteria": [
-        "src/rlm_rs/storage/s3.py provides boto3 helpers for put/get, range reads, gzip put/get, and deterministic JSON serialization for checksum stability.",
-        "Deterministic serialization is verified by repeating the same logical JSON and observing identical bytes and checksum in tests.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q tests/unit -k s3 exits 0."
+        "Start Answerer modal includes an Output Mode selector with Answer and Contexts options and defaults to Answer.",
+        "Selecting Contexts sends options.output_mode=CONTEXTS in the create execution request.",
+        "Executions list displays an Output Mode badge or label for Answerer executions that shows Contexts when applicable.",
+        "Playwright MCP checks: use browser_navigate to /sessions/{session_id}, browser_click to open Start Answerer modal, browser_snapshot to verify Output Mode control, browser_click to select Contexts, submit, then browser_navigate to /executions and browser_snapshot to verify the Contexts badge on the new execution.",
+        "Typecheck passes: npm run typecheck --prefix ui exits 0.",
+        "Tests pass: npm test --prefix ui exits 0."
       ],
       "priority": 6,
       "passes": true,
@@ -87,13 +97,16 @@
     },
     {
       "id": "US-007",
-      "title": "Implement DynamoDB storage helpers",
+      "title": "Render contexts focused execution detail layout in UI",
       "acceptanceCriteria": [
-        "src/rlm_rs/storage/ddb.py provides boto3 CRUD wrappers for sessions, documents, executions, and execution_state with explicit key design and conditional status transitions.",
-        "A lease/lock helper prevents two orchestrators from advancing the same execution concurrently using conditional writes.",
-        "Integration test with LocalStack passes: uv run pytest -q tests/integration -k ddb_s3_roundtrip exits 0.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
+        "When output_mode=CONTEXTS, the execution detail page renders Context Timeline and Context Inspector sections instead of Answer and Baseline panels.",
+        "Context items are collapsed by default and expand to show full text, with discovery order shown using sequence_index and turn_index.",
+        "Selecting a context shows metadata, citation link with full SpanRef query params, and the repl code for the same turn using the code log, with a visible empty state when code is unavailable.",
+        "Timeline order follows sequence_index and the UI displays the order index for each context in ascending order.",
+        "When contexts_s3_uri is present, the UI loads contexts via GET /v1/executions/{execution_id}/contexts before rendering the timeline.",
+        "Playwright MCP checks: browser_navigate to a contexts execution detail page, browser_snapshot to verify Context Timeline and Context Inspector headings, browser_snapshot to verify contexts are collapsed initially, browser_click the first context row, browser_snapshot to verify metadata and citation link, browser_click to expand full text, then browser_click another context and browser_snapshot to verify repl code block updates.",
+        "Typecheck passes: npm run typecheck --prefix ui exits 0.",
+        "Tests pass: npm test --prefix ui exits 0."
       ],
       "priority": 7,
       "passes": true,
@@ -101,1050 +114,16 @@
     },
     {
       "id": "US-008",
-      "title": "Implement JSON-only state offload policy",
+      "title": "Update specs and UI documentation for contexts mode",
       "acceptanceCriteria": [
-        "src/rlm_rs/storage/state.py enforces JSON-only state, rejecting non-JSON types and applying inline versus S3 offload with stored checksum and summary metadata.",
-        "Cutoffs are configurable and tests cover both inline and offload paths without hardcoded unexplained constants.",
+        "docs/rls_spec.md documents output_mode=CONTEXTS, tag matching rules (context or context:*), context schema fields, and response fields contexts and contexts_s3_uri.",
+        "docs/sequence.md includes the contexts completion path without a final answer and mentions context tag usage.",
+        "docs/ui_spec.md documents the Output Mode selector and the Contexts execution layout with timeline and inspector.",
+        "Docs verification: rg -n \"output_mode|contexts_s3_uri|sequence_index|context:\" docs/rls_spec.md docs/sequence.md docs/ui_spec.md returns matches.",
         "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q tests/unit -k state_json_validation exits 0."
+        "Tests pass: uv run pytest -q exits 0."
       ],
       "priority": 8,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-009",
-      "title": "Implement parser service and client",
-      "acceptanceCriteria": [
-        "src/rlm_rs/parser/service.py implements FastAPI POST /parse that reads a raw S3 object and writes deterministic canonical text.txt, meta.json, and offsets.json to parsed/... in S3.",
-        "Parse responses return a non-empty text_checksum and repeated parses of the same input are byte-identical.",
-        "src/rlm_rs/parser/client.py uses httpx with tenacity retries and timeouts suitable for ingestion worker calls.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 9,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-010",
-      "title": "Implement sandbox AST policy",
-      "acceptanceCriteria": [
-        "src/rlm_rs/sandbox/ast_policy.py enforces Appendix B: rejects imports, globals/nonlocal, dunder attribute access, and banned names/modules.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q tests/unit -k ast_policy exits 0."
-      ],
-      "priority": 10,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-011",
-      "title": "Implement ContextView/DocView span slicing",
-      "acceptanceCriteria": [
-        "src/rlm_rs/sandbox/context.py implements ContextView and DocView backed by canonical parsed text in S3 with lazy reads instead of loading entire docs into LLM context.",
-        "DocView slicing and slice(a,b,tag) append span log entries with doc_index, start_char, end_char, and tag.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q tests/unit -k span_logging exits 0."
-      ],
-      "priority": 11,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-012",
-      "title": "Implement sandbox ToolAPI request queueing",
-      "acceptanceCriteria": [
-        "src/rlm_rs/sandbox/tool_api.py implements queue_llm, queue_search, YIELD, and FINAL, producing normalized tool request envelopes.",
-        "Per-step max tool request limits are enforced via limits snapshots and covered by tests.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 12,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-013",
-      "title": "Implement sandbox step executor and adapters",
-      "acceptanceCriteria": [
-        "src/rlm_rs/sandbox/step_executor.py enforces AST policy, restricts builtins (no open, __import__, eval, exec), injects context/state/tool, captures stdout with truncation, and enforces limits on spans, tool requests, and state size.",
-        "src/rlm_rs/sandbox/lambda_handler.py converts Lambda events to StepEvent/StepResult using the shared executor and includes a local adapter for dev.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q tests/unit -k step_executor_limits exits 0."
-      ],
-      "priority": 13,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-014",
-      "title": "Implement citation checksum utilities",
-      "acceptanceCriteria": [
-        "src/rlm_rs/orchestrator/citations.py merges and deduplicates spans and computes checksums using NFC normalization and SHA-256 over UTF-8 bytes.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q tests/unit -k checksum_determinism exits 0."
-      ],
-      "priority": 14,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-015",
-      "title": "Add FastAPI service skeleton and health",
-      "acceptanceCriteria": [
-        "FastAPI app under src/rlm_rs/api/ wires routers and dependencies for settings, logging, and storage.",
-        "GET /health/live returns JSON with status equal to ok.",
-        "GET /health/ready returns JSON with status equal to ok when dependencies are reachable.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 15,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-016",
-      "title": "Add API auth with hashed API keys",
-      "acceptanceCriteria": [
-        "Protected endpoints require Authorization: Bearer rlm_key_... and missing or invalid keys return 401 using the spec error envelope.",
-        "API keys are stored as a keyed HMAC-SHA256 hash with a server-side pepper and compared via hmac.compare_digest.",
-        "Tenant ownership checks are enforced for all storage access paths.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 16,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-017",
-      "title": "Implement sessions endpoints",
-      "acceptanceCriteria": [
-        "POST /v1/sessions, GET /v1/sessions/{session_id}, and DELETE /v1/sessions/{session_id} are implemented exactly as listed in the plan.",
-        "Creating a session persists the session record and associated document records with initial ingest status as described in the ingestion plan.",
-        "Cross-tenant access is blocked with the spec error envelope.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 17,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-018",
-      "title": "Implement Answerer executions endpoints",
-      "acceptanceCriteria": [
-        "POST /v1/sessions/{session_id}/executions, GET /v1/executions/{execution_id}, and POST /v1/executions/{execution_id}/wait are implemented exactly as listed in the plan.",
-        "Creating an execution persists execution and execution_state records that comply with the JSON-only state policy.",
-        "wait behavior matches the spec using deterministic fakes in integration tests.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 18,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-019",
-      "title": "Implement runtime mode step and tool resolution",
-      "acceptanceCriteria": [
-        "POST /v1/sessions/{session_id}/executions/runtime, POST /v1/executions/{execution_id}/steps, and POST /v1/executions/{execution_id}/tools/resolve are implemented exactly as listed in the plan.",
-        "/steps runs the sandbox executor and persists stdout, state, span_log, and tool_requests; /tools/resolve resolves queued tool requests out-of-sandbox and writes results into state['_tool_results'].",
-        "Runtime mode integration with a fake provider queues one LLM request, resolves it, and finalizes with tool.FINAL.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 19,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-020",
-      "title": "Implement spans and citation verification endpoints",
-      "acceptanceCriteria": [
-        "POST /v1/spans/get and POST /v1/citations/verify are implemented using runtime span logs rather than parsing generated code.",
-        "Integration coverage verifies a valid SpanRef passes and a tampered SpanRef fails.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 20,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-021",
-      "title": "Implement ingestion worker parse pipeline",
-      "acceptanceCriteria": [
-        "Ingestion worker polls DynamoDB for documents with ingest_status REGISTERED or PARSING and sessions in CREATING, calls the parser service, updates document pointers and checksums, and sets ingest_status to PARSED.",
-        "Session readiness follows the plan: readiness_mode=LAX becomes READY after PARSED; readiness_mode=STRICT remains blocked until indexing is implemented.",
-        "Idempotency is verified: retries do not corrupt state or pointers.",
-        "Local smoke is documented and works: upload a small raw doc to S3, POST /v1/sessions referencing it, then GET /v1/sessions/{id} returns READY with text_s3_uri present.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 21,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-022",
-      "title": "Implement orchestrator root prompt and parser",
-      "acceptanceCriteria": [
-        "Root prompt builder matches Appendix D intent and supports toggling subcalls enabled or disabled.",
-        "Root output parser enforces exactly one ```repl ...``` block and rejects any output outside the block.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q tests/unit -k root_output_parser exits 0."
-      ],
-      "priority": 22,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-023",
-      "title": "Implement Answerer orchestrator loop with FakeLLMProvider",
-      "acceptanceCriteria": [
-        "Orchestrator worker implements the managed RLM loop: invokes sandbox steps, resolves LLM tool requests with a deterministic FakeLLMProvider, and persists status transitions in DynamoDB using the execution lease to avoid double-advance.",
-        "Budgets are enforced at the orchestrator level (turns, time, total subcalls, total prompt characters) in addition to sandbox per-step limits.",
-        "Integration with FakeLLMProvider completes an Answerer execution that terminates via tool.FINAL and persists COMPLETED status with citations present.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 23,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-024",
-      "title": "Add OpenAI provider integration and S3 cache",
-      "acceptanceCriteria": [
-        "LLM provider interface includes an OpenAIProvider using the official openai Python SDK and a FakeLLMProvider for tests.",
-        "Provider calls use tenacity to apply consistent retry and timeout policies.",
-        "S3-backed caching uses stable hash keys per spec 12.3; repeated identical requests hit the cache in tests.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 24,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-025",
-      "title": "Add end-to-end local smoke test script",
-      "acceptanceCriteria": [
-        "scripts/smoke_test.sh starts compose dependencies, uploads a tiny fixture doc to raw S3, creates a session, waits for READY, starts an Answerer execution (FakeLLMProvider by default), polls to completion, and verifies citations via /v1/citations/verify.",
-        "bash scripts/smoke_test.sh exits 0 and prints the final answer plus at least one valid=true citation verification result.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 25,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-026",
-      "title": "Harden safety and determinism tests",
-      "acceptanceCriteria": [
-        "Test suite covers AST rejection (imports, dunder access, banned builtins and names), sandbox limits for infinite loops, stdout truncation, max spans per step, state JSON validation and offload behavior, and citation checksum mismatch detection.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 26,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-027",
-      "title": "Add Docker images and .env.example",
-      "acceptanceCriteria": [
-        "Dockerfiles docker/api.Dockerfile, docker/worker.Dockerfile, and docker/parser.Dockerfile build using uv sync --frozen.",
-        ".env.example documents all env vars and defaults for API, workers, and parser, including LocalStack overrides and feature flags.",
-        "docker compose build succeeds, then docker compose up -d starts services.",
-        "curl -sS http://localhost:<api_port>/health/ready | jq -r .status returns ok (using the mapped API port from compose.yaml).",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 27,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-028",
-      "title": "Add rate limiting, request limits, observability",
-      "acceptanceCriteria": [
-        "Per-tenant rate limiting and request size limits are enforced with configurable thresholds and tests using low thresholds to verify 429 and 413 behaviors.",
-        "Trace redaction controls return_trace and redact_trace can be toggled by configuration.",
-        "Metrics via prometheus-client and optional OpenTelemetry tracing are wired and safe to disable by environment variables.",
-        "Secrets boundary is preserved: sandbox step execution receives no provider secrets and cannot make provider calls, with regression tests covering this boundary.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 28,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-029",
-      "title": "Add load-test harness (small scale first)",
-      "acceptanceCriteria": [
-        "scripts/load_test.sh runs the smoke test repeatedly and records budgets distribution, cache hit rates, and execution durations to a local artifact (JSON or CSV).",
-        "Sub-minute version runs first to validate the pipeline, and scaling changes only one scale parameter at a time.",
-        "bash scripts/load_test.sh --iterations 1 exits 0 and writes the summary artifact.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 29,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-030",
-      "title": "Optional MCP server wrapper",
-      "acceptanceCriteria": [
-        "src/rlm_rs/mcp/ implements an MCP server mapping tools 1:1 to the HTTP API endpoints from plan Step 16 using httpx as a thin transport adapter.",
-        "Manual verification via an MCP client against the local API covers create session, start execution, and verify citation.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 30,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-031",
-      "title": "Optional search tool resolution backend",
-      "acceptanceCriteria": [
-        "A SearchBackend interface supports tool.queue_search and is used by orchestrator tool resolution, gated by the enable_search feature flag.",
-        "With enable_search=false, queued search requests are rejected with a clear spec error; with enable_search=true, a fake backend returns deterministic hits including doc_index, start_char, and end_char.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 31,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-032",
-      "title": "Optional search indexing and readiness gating",
-      "acceptanceCriteria": [
-        "With search enabled, ingestion indexes parsed documents and transitions PARSED to INDEXING to INDEXED; session readiness follows the plan (readiness_mode=LAX is READY after PARSED, readiness_mode=STRICT after INDEXED).",
-        "Chunking stores doc_index, start_char, and end_char per chunk with configurable defaults aligned to the plan guidance.",
-        "Search caching in S3 per spec 12.3 is verified by repeat identical search requests hitting the cache.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 32,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-033",
-      "title": "Bootstrap Next.js UI in monorepo",
-      "acceptanceCriteria": [
-        "ui/ directory contains a Next.js 14+ app created with create-next-app using TypeScript, App Router, Tailwind CSS, and ESLint.",
-        "ui/package.json specifies engines.node >=20, and includes scripts: dev, build, start, lint, and typecheck (tsc --noEmit).",
-        "ui/tsconfig.json enables strict mode and noUncheckedIndexedAccess.",
-        "ui/.eslintrc.json extends next/core-web-vitals and next/typescript.",
-        "npm install --prefix ui completes without errors.",
-        "npm run typecheck --prefix ui exits 0 with zero type errors.",
-        "npm run lint --prefix ui exits 0 with zero lint errors.",
-        "npm run build --prefix ui exits 0 and produces .next/ directory.",
-        "npm run dev --prefix ui starts server; curl -sS http://localhost:3000 returns HTTP 200.",
-        "ui/src/app/page.tsx renders a placeholder homepage.",
-        "Python typecheck passes: uv run ruff check . exits 0.",
-        "Python tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 33,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-034",
-      "title": "Add shared TypeScript types and API client",
-      "acceptanceCriteria": [
-        "ui/src/lib/types.ts defines TypeScript interfaces that exactly match Python Pydantic models: Session (id, tenant_id, status, readiness_mode, docs, options, ttl_seconds, created_at, expires_at), Document (id, session_id, source_name, mime_type, raw_s3_uri, text_s3_uri, meta_s3_uri, offsets_s3_uri, text_checksum, ingest_status), Execution (id, session_id, tenant_id, mode, status, question, answer, citations, budgets_consumed, turn_count, started_at, completed_at), SpanRef (tenant_id, session_id, doc_id, doc_index, start_char, end_char, checksum), Citation (doc_index, start_char, end_char, checksum, text), StepResult (stdout, state, span_log, tool_requests, error), ToolRequest (type, payload), Budgets (max_turns, max_time_seconds, max_subcalls, max_prompt_chars), and ErrorEnvelope (code, message, details).",
-        "ui/src/lib/api-client.ts exports class ApiClient with methods: getHealth(), getSessions(), getSession(id), createSession(req), deleteSession(id), getExecution(id), createExecution(sessionId, req), createRuntimeExecution(sessionId), postStep(executionId, code), resolveTools(executionId), getSpan(spanRef), verifyCitation(spanRef).",
-        "ApiClient constructor accepts baseUrl and apiKey; all methods include Authorization: Bearer header and Content-Type: application/json.",
-        "ApiClient methods throw typed ApiError extending Error with code, message, and details fields parsed from ErrorEnvelope responses.",
-        "ui/src/lib/config.ts exports: API_BASE_URL (process.env.NEXT_PUBLIC_API_BASE_URL or http://localhost:8080), LOCALSTACK_ENDPOINT_URL (process.env.NEXT_PUBLIC_LOCALSTACK_ENDPOINT_URL or http://localhost:4566), S3_BUCKET (rlm-local), DDB_TABLE_PREFIX (rlm), TENANT (tenant_local), DEV_KEY (rlm_key_local), API_KEY_PEPPER (smoke-pepper).",
-        "ui/src/lib/s3-client.ts exports uploadFile(bucket, key, file, endpoint) using @aws-sdk/client-s3 with endpoint override for LocalStack.",
-        "ui/src/lib/ddb-client.ts exports putApiKey(hash, tenantId, endpoint) using @aws-sdk/client-dynamodb with endpoint override.",
-        "ui/src/lib/crypto.ts exports computeApiKeyHash(key, pepper) returning HMAC-SHA256 hex string using Web Crypto API.",
-        "npm run typecheck --prefix ui exits 0.",
-        "npm run lint --prefix ui exits 0."
-      ],
-      "priority": 34,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-035",
-      "title": "Implement toast notifications and app context",
-      "acceptanceCriteria": [
-        "ui/src/components/ui/toast.tsx implements a toast notification component with variants: success (green), error (red), info (blue).",
-        "ui/src/contexts/ToastContext.tsx provides useToast hook returning showToast(message, variant, duration?) function.",
-        "ui/src/contexts/AppContext.tsx provides useApp hook exposing: apiHealth (online/offline/unknown), localstackHealth (online/offline/unknown), runningExecutionsCount (number), config (editable settings), refreshHealth() function.",
-        "AppContext polls health every 10 seconds: GET {API_BASE_URL}/health/ready for API, HEAD {LOCALSTACK_ENDPOINT_URL}/{S3_BUCKET} for LocalStack.",
-        "AppContext counts RUNNING executions by polling API (or maintains local state updated by execution screens).",
-        "ui/src/app/layout.tsx wraps children with ToastProvider and AppProvider.",
-        "Toast appears in top-right corner with auto-dismiss after 5 seconds (configurable).",
-        "npm run typecheck --prefix ui exits 0.",
-        "npm run lint --prefix ui exits 0.",
-        "npm run build --prefix ui exits 0."
-      ],
-      "priority": 35,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-036",
-      "title": "Implement global layout with top bar and sidebar",
-      "acceptanceCriteria": [
-        "ui/src/components/layout/TopBar.tsx renders horizontal bar with: API health badge showing Online (green) or Offline (red) based on apiHealth from AppContext, LocalStack health badge showing Online/Offline, tenant label displaying tenant_local, dev key badge displaying Using dev key: rlm_key_local.",
-        "Clicking API or LocalStack health badge navigates to /debug using Next.js router.",
-        "ui/src/components/layout/Sidebar.tsx renders vertical navigation with links: Sessions (/sessions), Executions (/executions), Debug (/debug).",
-        "Sidebar displays running executions count badge next to Executions link when count > 0.",
-        "Sidebar displays LocalStack status dot (green circle when online, red when offline) at bottom.",
-        "ui/src/components/layout/AppShell.tsx combines TopBar and Sidebar with main content area; sidebar is collapsible on mobile via hamburger menu.",
-        "ui/src/app/layout.tsx renders AppShell wrapping page content.",
-        "Active navigation link is visually highlighted.",
-        "npm run typecheck --prefix ui exits 0.",
-        "npm run lint --prefix ui exits 0.",
-        "npm run build --prefix ui exits 0."
-      ],
-      "priority": 36,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-037",
-      "title": "Implement auto-seed dev key behavior",
-      "acceptanceCriteria": [
-        "ui/src/hooks/useAutoSeed.ts exports hook that on mount checks localStorage.getItem('rlm_seeded'); if not 'true', computes hash via computeApiKeyHash(DEV_KEY, API_KEY_PEPPER), calls putApiKey with PK=SK=KEY#{hash} and tenant_id=TENANT to LocalStack DynamoDB table {DDB_TABLE_PREFIX}_api_keys.",
-        "On successful seed: sets localStorage.setItem('rlm_seeded', 'true'), calls showToast('Seeded API key in LocalStack', 'success').",
-        "On failed seed: calls showToast('Failed to seed API key. Check LocalStack status.', 'error'), does not set localStorage.",
-        "ui/src/app/layout.tsx calls useAutoSeed hook.",
-        "ui/src/lib/seed.ts exports triggerReseed() that removes localStorage item 'rlm_seeded' and calls the seed logic, returning Promise<boolean> for success/failure.",
-        "Unit test verifies hash computation matches Python HMAC-SHA256 output for same inputs.",
-        "npm run typecheck --prefix ui exits 0.",
-        "npm run lint --prefix ui exits 0."
-      ],
-      "priority": 37,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-038",
-      "title": "Implement Sessions screen with upload and table",
-      "acceptanceCriteria": [
-        "ui/src/app/sessions/page.tsx renders Sessions screen with two sections: Upload and Create card, Sessions table.",
-        "Upload card contains: file input with drag-and-drop zone (accepts any file), source name text input (auto-populated from file.name, editable), MIME type text input (auto-populated from file.type or application/octet-stream, editable), TTL minutes number input (default 60, min 1, max 1440), enable search checkbox (default unchecked), readiness mode select with options LAX and STRICT (default LAX).",
-        "Upload and Create button is disabled until file is selected; shows spinner during upload.",
-        "On click: generates UUID, uploads file to s3://{S3_BUCKET}/raw/{TENANT}/{uuid}/{filename} via uploadFile, then calls apiClient.createSession with docs array containing single doc with source_name, mime_type, raw_s3_uri, and session options (enable_search, readiness_mode, ttl_seconds).",
-        "On success: shows success toast, clears form, refreshes sessions table.",
-        "On error: shows error toast with message from ErrorEnvelope, keeps form populated.",
-        "Progress bar shows upload percentage during S3 upload.",
-        "Sessions table fetches sessions via apiClient.getSessions() on mount and after create.",
-        "Table columns: Session ID (truncated with copy button), Status (pill: CREATING=yellow, READY=green, EXPIRED=gray, FAILED=red), Readiness (Parsed/Search based on readiness_mode), Doc count, Created at (formatted datetime), Open button.",
-        "Open button navigates to /sessions/[session_id].",
-        "Table shows loading skeleton during fetch, empty state message when no sessions.",
-        "npm run typecheck --prefix ui exits 0.",
-        "npm run lint --prefix ui exits 0."
-      ],
-      "priority": 38,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-039",
-      "title": "Implement Session Detail screen",
-      "acceptanceCriteria": [
-        "ui/src/app/sessions/[session_id]/page.tsx fetches session via apiClient.getSession(session_id) on mount.",
-        "Header displays: Session ID with copy button, status pill (color-coded), TTL countdown showing minutes:seconds remaining until expires_at (updates every second), created at timestamp.",
-        "Docs list table shows columns: Doc ID (truncated), Source name, Ingest status (pill: REGISTERED=gray, PARSING=yellow, PARSED=green, FAILED=red), Parsed URIs (links to text/meta/offsets S3 URIs when available), View parsed text button (enabled when text_s3_uri exists).",
-        "View parsed text button opens slide-over drawer; drawer fetches text content from S3 via signed URL or direct LocalStack fetch, displays in monospace pre block with line numbers.",
-        "Start Answerer button (enabled when status=READY) opens StartAnswererModal.",
-        "Start Runtime button (enabled when status=READY) opens StartRuntimeModal.",
-        "Page polls apiClient.getSession every 5 seconds while status is CREATING; stops polling when READY, EXPIRED, or FAILED.",
-        "Loading skeleton shown during initial fetch; error state shown if fetch fails.",
-        "Back to Sessions link at top navigates to /sessions.",
-        "npm run typecheck --prefix ui exits 0.",
-        "npm run lint --prefix ui exits 0."
-      ],
-      "priority": 39,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-040",
-      "title": "Implement Start Answerer modal and execution view",
-      "acceptanceCriteria": [
-        "ui/src/components/modals/StartAnswererModal.tsx renders modal with: question textarea (required, min 1 char), root_model text input (optional, placeholder shows API default), sub_model text input (optional), budgets JSON textarea (optional, validates as JSON, placeholder shows example), return_trace checkbox, redact_trace checkbox, Cancel button, Start Execution button.",
-        "Start Execution calls apiClient.createExecution(sessionId, { question, root_model, sub_model, budgets, return_trace, redact_trace }); on success navigates to /executions/[execution_id], on error shows toast.",
-        "ui/src/app/executions/[execution_id]/page.tsx fetches execution via apiClient.getExecution(execution_id) on mount.",
-        "Left panel displays: Execution ID with copy button, Status pill (PENDING=gray, RUNNING=yellow, COMPLETED=green, FAILED=red, CANCELLED=gray), Mode badge (Answerer), Budgets consumed (turns, time, subcalls as progress bars if max known), Turn count, Total seconds (computed from started_at to completed_at or now), LLM subcalls count.",
-        "Right panel displays: Answer box (shows answer text when COMPLETED, shows waiting... animation when RUNNING, shows error message when FAILED), Citations list.",
-        "Citations list shows each citation as card: Doc {doc_index} with char range {start_char}-{end_char}, checksum truncated, Inspect button.",
-        "Inspect button navigates to /citations?tenant_id=...&session_id=...&doc_id=...&doc_index=...&start_char=...&end_char=...&checksum=... (URL-encoded query params).",
-        "Page polls apiClient.getExecution every 2 seconds while status is PENDING or RUNNING; stops on COMPLETED, FAILED, CANCELLED.",
-        "npm run typecheck --prefix ui exits 0.",
-        "npm run lint --prefix ui exits 0."
-      ],
-      "priority": 40,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-041",
-      "title": "Implement Runtime execution multi-step editor",
-      "acceptanceCriteria": [
-        "ui/src/components/modals/StartRuntimeModal.tsx renders modal with Start Runtime button that calls apiClient.createRuntimeExecution(sessionId); on success navigates to /executions/[execution_id]/runtime.",
-        "ui/src/app/executions/[execution_id]/runtime/page.tsx displays two-panel layout: left panel for step editor, right panel for output inspector.",
-        "Step editor displays ordered list of steps; each step has: step number, code textarea (monospace font, syntax highlighting optional), Remove button, drag handle for reorder.",
-        "Add Step button appends new empty step to list.",
-        "Run controls bar contains: Run Step button (runs currently focused step), Run All button (runs all steps sequentially), Reset State button.",
-        "Run Step posts code to apiClient.postStep(executionId, code); displays result in output inspector.",
-        "Run All iterates steps in order, calling postStep for each; halts on first error; shows progress indicator.",
-        "Reset State calls apiClient.createRuntimeExecution(sessionId) to create fresh execution, updates URL, clears output inspector, preserves step code.",
-        "Output inspector has tabs: stdout (pre block with step stdout), state (collapsible JSON tree viewer showing state object), span log (table of spans with doc_index, start, end, tag), tool requests (list of pending tool requests with type and payload).",
-        "Each step result card shows: step number, success/error badge, execution time in ms, expand/collapse for details.",
-        "npm run typecheck --prefix ui exits 0.",
-        "npm run lint --prefix ui exits 0."
-      ],
-      "priority": 41,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-042",
-      "title": "Implement Citation Viewer screen",
-      "acceptanceCriteria": [
-        "ui/src/app/citations/page.tsx reads SpanRef fields from URL query params: tenant_id, session_id, doc_id, doc_index, start_char, end_char, checksum.",
-        "If any required param missing, displays error message with link back to executions.",
-        "Metadata section displays labeled fields: Tenant ID, Session ID, Doc ID, Doc index, Start char, End char, Checksum (full value with copy button).",
-        "Excerpt section fetches text via apiClient.getSpan({ tenant_id, session_id, doc_id, doc_index, start_char, end_char, checksum }); displays text with the cited span highlighted in yellow background.",
-        "Context range controls: two number inputs for chars before and chars after (defaults 200 each); changing values refetches with expanded range.",
-        "Verify citation button calls apiClient.verifyCitation(spanRef); displays result: green checkmark with Valid if valid=true, red X with Invalid: {reason} if valid=false.",
-        "Loading states shown during fetch; error states shown with message from API.",
-        "Back link navigates to previous page (or /executions if no history).",
-        "npm run typecheck --prefix ui exits 0.",
-        "npm run lint --prefix ui exits 0."
-      ],
-      "priority": 42,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-043",
-      "title": "Implement Executions list screen",
-      "acceptanceCriteria": [
-        "ui/src/app/executions/page.tsx fetches executions via API endpoint (add GET /v1/executions to API if not exists, or use client-side filtering of known executions).",
-        "Filter bar contains: status dropdown (All, PENDING, RUNNING, COMPLETED, FAILED, CANCELLED), mode dropdown (All, Answerer, Runtime), session ID text input (filters by prefix match).",
-        "Filters apply client-side to fetched data; URL query params sync with filter state for shareability.",
-        "Executions table columns: Execution ID (truncated with copy), Session ID (truncated, links to /sessions/[id]), Mode (Answerer/Runtime badge), Status (color-coded pill), Started at (formatted, or - if null), Completed at (formatted, or - if null), Open button.",
-        "Open button navigates to /executions/[id] for Answerer mode, /executions/[id]/runtime for Runtime mode.",
-        "Table sorted by started_at descending (newest first).",
-        "Pagination or infinite scroll if >50 executions.",
-        "Loading skeleton during fetch; empty state when no executions match filters.",
-        "Auto-refresh every 10 seconds to catch new executions.",
-        "npm run typecheck --prefix ui exits 0.",
-        "npm run lint --prefix ui exits 0."
-      ],
-      "priority": 43,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-044",
-      "title": "Implement Debug screen",
-      "acceptanceCriteria": [
-        "ui/src/app/debug/page.tsx displays four panels: API Health, LocalStack Health, Recent Requests, Errors.",
-        "API Health panel shows: last health check timestamp, raw JSON response from /health/ready in collapsible pre block, status badge.",
-        "LocalStack Health panel shows: last check timestamp, S3 bucket check result (accessible/not accessible), DynamoDB tables check listing all rlm_* tables found, status badge.",
-        "Recent Requests panel shows last 20 API requests logged by ApiClient: timestamp, method, URL, status code, latency in ms; stored in localStorage or React state; newest first.",
-        "Errors panel shows last 10 errors caught by ApiClient or app: timestamp, message, stack trace in collapsible block; stored in React state.",
-        "Refresh button triggers immediate refreshHealth() from AppContext.",
-        "Clear request log button clears the recent requests list.",
-        "Re-seed dev key button calls triggerReseed() and shows toast with result.",
-        "Configuration panel (collapsed by default, expand via Settings button): editable inputs for API base URL, LocalStack endpoint, S3 bucket, DDB table prefix, Tenant, Dev key, API key pepper; Save button persists to localStorage and updates AppContext config; Reset to defaults button.",
-        "npm run typecheck --prefix ui exits 0.",
-        "npm run lint --prefix ui exits 0."
-      ],
-      "priority": 44,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-045",
-      "title": "Add loading states, error boundaries, and empty states",
-      "acceptanceCriteria": [
-        "ui/src/components/ui/Skeleton.tsx implements skeleton loader components: SkeletonText, SkeletonCard, SkeletonTable (configurable rows/columns).",
-        "All data-fetching pages use Skeleton components during loading: Sessions table, Session Detail, Execution view, Executions list, Debug panels.",
-        "ui/src/components/ui/EmptyState.tsx implements empty state component with icon, title, description, optional action button.",
-        "Empty states used: Sessions page when no sessions (Create your first session message with link to upload), Executions page when no executions, Execution citations when no citations.",
-        "ui/src/components/ErrorBoundary.tsx implements React error boundary catching render errors; displays friendly error message with Reload button and Show details expandable section.",
-        "ui/src/app/error.tsx implements Next.js error page for route errors.",
-        "ui/src/app/not-found.tsx implements 404 page with link to home.",
-        "API errors display ErrorEnvelope fields: code badge, message text, details in collapsible JSON block.",
-        "npm run typecheck --prefix ui exits 0.",
-        "npm run lint --prefix ui exits 0.",
-        "npm run build --prefix ui exits 0."
-      ],
-      "priority": 45,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-046",
-      "title": "Add UI Dockerfile and compose integration",
-      "acceptanceCriteria": [
-        "docker/ui.Dockerfile uses multi-stage build: Stage 1 (deps) FROM node:20-alpine, WORKDIR /app, COPY ui/package*.json, RUN npm ci; Stage 2 (build) copies deps, COPY ui/, RUN npm run build; Stage 3 (runner) FROM node:20-alpine, copies .next/standalone and .next/static, ENV NODE_ENV=production, EXPOSE 3000, CMD node server.js.",
-        "ui/next.config.js sets output: 'standalone' for Docker optimization.",
-        "compose.yaml adds rlm-ui service: build context ., dockerfile docker/ui.Dockerfile, ports 3000:3000, environment NEXT_PUBLIC_API_BASE_URL=http://rlm-api:8080 and NEXT_PUBLIC_LOCALSTACK_ENDPOINT_URL=http://localstack:4566, depends_on rlm-api (condition service_started).",
-        "docker compose build rlm-ui succeeds without errors.",
-        "docker compose up -d rlm-ui starts container; docker compose logs rlm-ui shows Ready on http://0.0.0.0:3000.",
-        "curl -sS http://localhost:3000 returns HTTP 200 with HTML containing RLM or app identifier.",
-        "npm run typecheck --prefix ui exits 0.",
-        "Python typecheck passes: uv run ruff check . exits 0."
-      ],
-      "priority": 46,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-047",
-      "title": "Add Playwright MCP server for E2E testing",
-      "acceptanceCriteria": [
-        "mcp_servers config adds a Playwright MCP server entry usable by Codex (no Claude or Anthropic-specific config).",
-        "ui/tests/e2e/screenshots/ directory exists and is gitignored except .gitkeep.",
-        "scripts/e2e/ directory created for test orchestration scripts that invoke Codex with Playwright MCP.",
-        "scripts/e2e/run-e2e-tests.sh script starts the UI dev server (npm run dev --prefix ui), waits for http://localhost:3000 to be available, then runs test scripts.",
-        "Playwright MCP server starts successfully when invoked; browser_navigate to http://localhost:3000 returns without error.",
-        "Playwright MCP browser_screenshot tool saves PNG to specified path.",
-        "npm run typecheck --prefix ui exits 0.",
-        "npm run lint --prefix ui exits 0."
-      ],
-      "priority": 47,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-048",
-      "title": "Add E2E smoke test for app shell and navigation via Playwright MCP",
-      "acceptanceCriteria": [
-        "scripts/e2e/test-app-shell.md documents the E2E test steps for app shell verification.",
-        "Test step 1: Use Playwright MCP browser_navigate to http://localhost:3000, verify page loads without error.",
-        "Test step 2: Use browser_screenshot to capture ui/tests/e2e/screenshots/app-shell-home.png.",
-        "Test step 3: Use browser_snapshot to verify top bar contains text API and LocalStack with Online or Offline badges.",
-        "Test step 4: Use browser_click on Sessions link, use browser_snapshot to verify URL contains /sessions.",
-        "Test step 5: Use browser_click on Executions link, verify URL contains /executions.",
-        "Test step 6: Use browser_click on Debug link, verify URL contains /debug.",
-        "Test step 7: Navigate to /sessions, use browser_snapshot to verify Sessions link has active styling (aria-current or active class).",
-        "Test step 8: Use browser_click on API health badge, verify navigation to /debug.",
-        "All steps documented with expected MCP tool calls and assertions.",
-        "With compose services running and UI at localhost:3000, all test steps pass when executed via Playwright MCP.",
-        "npm run typecheck --prefix ui exits 0."
-      ],
-      "priority": 48,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-049",
-      "title": "Add E2E test for session creation flow via Playwright MCP",
-      "acceptanceCriteria": [
-        "scripts/e2e/test-sessions.md documents the E2E test steps for session creation.",
-        "Test fixture: ui/tests/e2e/fixtures/test-doc.txt contains Hello, this is a test document for RLM. (at least 50 chars).",
-        "Test step 1: Use browser_navigate to http://localhost:3000/sessions, use browser_snapshot to verify Upload and Create heading visible.",
-        "Test step 2: Use browser_screenshot to capture ui/tests/e2e/screenshots/sessions/page-initial.png.",
-        "Test step 3: Use browser_file_upload to upload test-doc.txt to file input.",
-        "Test step 4: Use browser_snapshot to verify source name input is auto-populated with test-doc.txt.",
-        "Test step 5: Use browser_type to set TTL input to 30.",
-        "Test step 6: Use browser_click on Upload and Create button.",
-        "Test step 7: Wait and use browser_snapshot to verify success toast appears or new session row appears in table with status CREATING or READY.",
-        "Test step 8: Use browser_screenshot to capture ui/tests/e2e/screenshots/sessions/session-created.png.",
-        "Test step 9: Use browser_click on Open button for the created session.",
-        "Test step 10: Use browser_snapshot to verify URL matches /sessions/[uuid], verify Session ID displayed.",
-        "Test step 11: Use browser_screenshot to capture ui/tests/e2e/screenshots/sessions/session-detail.png.",
-        "Test step 12: Poll browser_snapshot up to 30s until status pill shows READY, verify Start Answerer button is enabled (not disabled).",
-        "All steps pass with compose services running.",
-        "npm run typecheck --prefix ui exits 0."
-      ],
-      "priority": 49,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-050",
-      "title": "Add E2E test for Answerer execution flow via Playwright MCP",
-      "acceptanceCriteria": [
-        "scripts/e2e/test-answerer.md documents the E2E test steps for Answerer execution.",
-        "Test prerequisite: Session exists and is READY (from previous test or created in setup).",
-        "Test step 1: From session detail page, use browser_click on Start Answerer button.",
-        "Test step 2: Use browser_snapshot to verify modal appears with question textarea visible.",
-        "Test step 3: Use browser_screenshot to capture ui/tests/e2e/screenshots/answerer/modal-open.png.",
-        "Test step 4: Use browser_type to enter question What is the main topic of this document? in textarea.",
-        "Test step 5: Use browser_click on Start Execution button.",
-        "Test step 6: Use browser_snapshot to verify URL matches /executions/[id].",
-        "Test step 7: Use browser_screenshot to capture ui/tests/e2e/screenshots/answerer/execution-started.png.",
-        "Test step 8: Use browser_snapshot to verify status shows RUNNING or PENDING.",
-        "Test step 9: Poll browser_snapshot up to 60s until status shows COMPLETED.",
-        "Test step 10: Use browser_snapshot to verify answer text appears (non-empty content in answer box).",
-        "Test step 11: Use browser_screenshot to capture ui/tests/e2e/screenshots/answerer/execution-completed.png.",
-        "Test step 12: Use browser_snapshot to verify Citations section visible with at least one citation card showing doc index and char range.",
-        "Test step 13: Use browser_screenshot to capture ui/tests/e2e/screenshots/answerer/citations-visible.png.",
-        "Test step 14: Use browser_click on Inspect button on first citation.",
-        "Test step 15: Use browser_snapshot to verify URL contains /citations with query params, verify metadata fields populated, verify excerpt text with yellow highlight visible.",
-        "Test step 16: Use browser_screenshot to capture ui/tests/e2e/screenshots/answerer/citation-viewer.png.",
-        "Test step 17: Use browser_click on Verify citation button, use browser_snapshot to verify result displays Valid or Invalid.",
-        "npm run typecheck --prefix ui exits 0."
-      ],
-      "priority": 50,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-051",
-      "title": "Add E2E test for Runtime multi-step flow via Playwright MCP",
-      "acceptanceCriteria": [
-        "scripts/e2e/test-runtime.md documents the E2E test steps for Runtime execution.",
-        "Test prerequisite: READY session exists.",
-        "Test step 1: From session detail, use browser_click on Start Runtime button.",
-        "Test step 2: Use browser_snapshot to verify modal appears, use browser_click on Start Runtime in modal.",
-        "Test step 3: Use browser_snapshot to verify URL matches /executions/[id]/runtime.",
-        "Test step 4: Use browser_screenshot to capture ui/tests/e2e/screenshots/runtime/editor-initial.png.",
-        "Test step 5: Use browser_snapshot to verify step textarea exists, use browser_type to enter print('hello from step 1').",
-        "Test step 6: Use browser_click on Run Step button.",
-        "Test step 7: Use browser_snapshot to verify stdout tab shows hello from step 1.",
-        "Test step 8: Use browser_screenshot to capture ui/tests/e2e/screenshots/runtime/step-1-result.png.",
-        "Test step 9: Use browser_click on Add Step, use browser_type to enter state['counter'] = 1 in step 2 textarea.",
-        "Test step 10: Use browser_click on Add Step, use browser_type to enter print(state.get('counter', 0)) in step 3 textarea.",
-        "Test step 11: Use browser_click on Run All button, wait for completion.",
-        "Test step 12: Use browser_snapshot to verify stdout shows 1, verify state tab shows JSON with counter: 1.",
-        "Test step 13: Use browser_screenshot to capture ui/tests/e2e/screenshots/runtime/run-all-completed.png.",
-        "Test step 14: Use browser_click on Reset State button.",
-        "Test step 15: Use browser_snapshot to verify URL has new execution ID, verify output inspector cleared, verify step code preserved.",
-        "Test step 16: Use browser_screenshot to capture ui/tests/e2e/screenshots/runtime/after-reset.png.",
-        "npm run typecheck --prefix ui exits 0."
-      ],
-      "priority": 51,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-052",
-      "title": "Add E2E test for Debug screen via Playwright MCP",
-      "acceptanceCriteria": [
-        "scripts/e2e/test-debug.md documents the E2E test steps for Debug screen.",
-        "Test step 1: Use browser_navigate to http://localhost:3000/debug.",
-        "Test step 2: Use browser_snapshot to verify API Health panel, LocalStack Health panel, and Recent Requests panel are visible.",
-        "Test step 3: Use browser_screenshot to capture ui/tests/e2e/screenshots/debug/initial.png.",
-        "Test step 4: Use browser_snapshot to verify API health shows Online, LocalStack health shows Online (with compose running).",
-        "Test step 5: Use browser_click on Refresh button, use browser_snapshot to verify timestamp updates or loading indicator appears then completes.",
-        "Test step 6: Use browser_snapshot to verify at least one request entry visible with method, URL, status code.",
-        "Test step 7: Use browser_click on Clear request log button, use browser_snapshot to verify request list is empty.",
-        "Test step 8: Use browser_click on Settings or Configuration toggle.",
-        "Test step 9: Use browser_snapshot to verify configuration panel expands showing input fields for API base URL, LocalStack endpoint, etc.",
-        "Test step 10: Use browser_screenshot to capture ui/tests/e2e/screenshots/debug/config-expanded.png.",
-        "Test step 11: Use browser_click on Re-seed dev key button.",
-        "Test step 12: Use browser_snapshot to verify toast appears with seed result message.",
-        "Test step 13: Use browser_screenshot to capture ui/tests/e2e/screenshots/debug/reseed-toast.png.",
-        "npm run typecheck --prefix ui exits 0."
-      ],
-      "priority": 52,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-053",
-      "title": "Add E2E test for Executions list and filters via Playwright MCP",
-      "acceptanceCriteria": [
-        "scripts/e2e/test-executions-list.md documents the E2E test steps for Executions list.",
-        "Test prerequisite: At least 2 executions exist (1 Answerer COMPLETED, 1 Runtime) from previous tests.",
-        "Test step 1: Use browser_navigate to http://localhost:3000/executions.",
-        "Test step 2: Use browser_snapshot to verify table visible with at least 2 rows.",
-        "Test step 3: Use browser_screenshot to capture ui/tests/e2e/screenshots/executions/list-initial.png.",
-        "Test step 4: Use browser_select or browser_click to select COMPLETED from status dropdown.",
-        "Test step 5: Use browser_snapshot to verify only COMPLETED executions shown, verify URL contains status=COMPLETED.",
-        "Test step 6: Use browser_select to select Answerer from mode dropdown, use browser_snapshot to verify only Answerer mode executions shown.",
-        "Test step 7: Use browser_type to enter partial session ID in session filter, use browser_snapshot to verify filtered results.",
-        "Test step 8: Reset all filters, use browser_snapshot to verify all executions shown again.",
-        "Test step 9: Use browser_click on Open button for Answerer execution, use browser_snapshot to verify URL is /executions/[id] (not /runtime).",
-        "Test step 10: Navigate back, use browser_click on Open for Runtime execution, use browser_snapshot to verify URL is /executions/[id]/runtime.",
-        "npm run typecheck --prefix ui exits 0."
-      ],
-      "priority": 53,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-054",
-      "title": "Add E2E test for responsive design via Playwright MCP",
-      "acceptanceCriteria": [
-        "scripts/e2e/test-responsive.md documents the E2E test steps for responsive design.",
-        "Test step 1: Use browser_resize to set viewport to mobile (375x667).",
-        "Test step 2: Use browser_navigate to http://localhost:3000/sessions.",
-        "Test step 3: Use browser_snapshot to verify page renders, verify sidebar is collapsed or hamburger menu visible.",
-        "Test step 4: Use browser_screenshot to capture ui/tests/e2e/screenshots/responsive/sessions-mobile.png.",
-        "Test step 5: Use browser_resize to set viewport to desktop (1280x800).",
-        "Test step 6: Use browser_navigate to http://localhost:3000/sessions.",
-        "Test step 7: Use browser_snapshot to verify sidebar is visible, verify table has all columns.",
-        "Test step 8: Use browser_screenshot to capture ui/tests/e2e/screenshots/responsive/sessions-desktop.png.",
-        "Test step 9: Use browser_resize to mobile, navigate to execution detail page.",
-        "Test step 10: Use browser_snapshot to verify left/right panels stack vertically or are scrollable.",
-        "Test step 11: Use browser_screenshot to capture ui/tests/e2e/screenshots/responsive/execution-mobile.png.",
-        "Test step 12: Use browser_navigate to /debug on mobile viewport.",
-        "Test step 13: Use browser_snapshot to verify panels stack vertically.",
-        "Test step 14: Use browser_screenshot to capture ui/tests/e2e/screenshots/responsive/debug-mobile.png.",
-        "Test step 15: Use browser_click on hamburger menu, use browser_snapshot to verify sidebar slides in.",
-        "Test step 16: Use browser_click outside sidebar or close button, use browser_snapshot to verify sidebar closes.",
-        "npm run typecheck --prefix ui exits 0."
-      ],
-      "priority": 54,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-055",
-      "title": "Add full UI E2E smoke script using Playwright MCP",
-      "acceptanceCriteria": [
-        "scripts/ui_smoke_test.sh is executable bash script.",
-        "Script starts services: docker compose up -d localstack localstack-init rlm-parser rlm-api rlm-ingestion-worker rlm-orchestrator-worker rlm-ui.",
-        "Script waits for API health: polls curl -sS http://localhost:8080/health/ready until status=ok or 60s timeout.",
-        "Script waits for UI health: polls curl -sS http://localhost:3000 until HTTP 200 or 60s timeout.",
-        "scripts/e2e/run-all-tests.md provides a checklist of all E2E test scripts to run via Playwright MCP in order: test-app-shell, test-sessions, test-answerer, test-runtime, test-debug, test-executions-list, test-responsive.",
-        "Each test script in scripts/e2e/ is designed to be executed by Codex with Playwright MCP, with clear pass/fail criteria based on browser_snapshot assertions.",
-        "Script collects screenshots: lists all files in ui/tests/e2e/screenshots/ after tests complete.",
-        "Script exits 0 if all services start and UI is accessible, non-zero otherwise.",
-        "bash scripts/ui_smoke_test.sh exits 0 when run with working services.",
-        "Script handles cleanup on interrupt: traps SIGINT/SIGTERM to run docker compose down.",
-        "npm run typecheck --prefix ui exits 0.",
-        "Python typecheck passes: uv run ruff check . exits 0.",
-        "Python tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 55,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-056",
-      "title": "Add API endpoint for listing executions",
-      "acceptanceCriteria": [
-        "src/rlm_rs/api/routes/executions.py adds GET /v1/executions endpoint.",
-        "Endpoint accepts optional query params: status (filter), mode (filter: answerer/runtime), session_id (filter by prefix), limit (default 100, max 1000), cursor (for pagination).",
-        "Response body: { executions: Execution[], next_cursor: string | null }.",
-        "Endpoint queries DynamoDB rlm_executions with tenant filter from auth.",
-        "Cross-tenant access blocked; only returns executions for authenticated tenant.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q tests/unit -k list_executions exits 0.",
-        "Integration test verifies filtering and pagination."
-      ],
-      "priority": 56,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-057",
-      "title": "Add API endpoint for listing sessions",
-      "acceptanceCriteria": [
-        "src/rlm_rs/api/routes/sessions.py adds GET /v1/sessions endpoint (if not already present).",
-        "Endpoint accepts optional query params: status (filter), limit (default 100, max 1000), cursor (for pagination).",
-        "Response body: { sessions: Session[], next_cursor: string | null }.",
-        "Endpoint queries DynamoDB rlm_sessions with tenant filter from auth.",
-        "Cross-tenant access blocked.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 57,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-058",
-      "title": "Add evaluation storage table and models",
-      "acceptanceCriteria": [
-        "src/rlm_rs/storage/ddb.py adds evaluations to DdbTableNames and build_table_names.",
-        "src/rlm_rs/storage/ddb.py defines evaluation key helpers and create/get helpers for evaluation records.",
-        "scripts/localstack_init.sh creates rlm_evaluations table (respects DDB_TABLE_PREFIX).",
-        "src/rlm_rs/models.py adds EvaluationBaselineStatus and EvaluationRecord with fields: evaluation_id, tenant_id, session_id, execution_id, mode, question, answer, baseline_status, baseline_skip_reason, baseline_answer, baseline_input_tokens, baseline_context_window, created_at.",
-        "Existing DdbTableNames test fixtures updated to include evaluations table name.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q tests/unit -k evaluation exits 0."
-      ],
-      "priority": 58,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-059",
-      "title": "Build full-document baseline prompt and fit check",
-      "acceptanceCriteria": [
-        "Baseline logic only runs for ExecutionMode.ANSWERER; runtime executions are skipped with baseline_skip_reason set to RUNTIME_MODE.",
-        "Baseline prompt concatenates all parsed text in doc_index order from text_s3_uri, joined with \\n\\n, with no normalization or trimming.",
-        "src/rlm_rs/settings.py adds MODEL_CONTEXT_WINDOWS_JSON with defaults for gpt-5=400000 and gpt-5-nano=400000; .env.example and compose.yaml updated per env var checklist.",
-        "Fit check uses OpenAI Responses input_tokens for the baseline prompt and model, no local estimation.",
-        "If model context window is unknown or token count exceeds the window, baseline is skipped with baseline_skip_reason set to UNKNOWN_CONTEXT_WINDOW or CONTEXT_WINDOW_EXCEEDED.",
-        "If any document lacks parsed text (non-PARSED or missing text_s3_uri), baseline is skipped with baseline_skip_reason set to MISSING_PARSED_TEXT.",
-        "Tests cover fit check branches and deterministic concatenation: uv run pytest -q tests/unit -k baseline exits 0."
-      ],
-      "priority": 59,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-060",
-      "title": "Create baseline evaluation per answerer execution",
-      "acceptanceCriteria": [
-        "Orchestrator triggers baseline evaluation after answerer execution completes with status COMPLETED.",
-        "Baseline run uses the same model config and question as the execution and bypasses sandbox and retrieval.",
-        "Evaluation record is persisted in rlm_evaluations with execution_id, session_id, tenant_id, mode, question, answer, baseline_answer, baseline_status, baseline_skip_reason, baseline_input_tokens, baseline_context_window, created_at.",
-        "If baseline is skipped, evaluation record is still created with baseline_answer null and baseline_status SKIPPED.",
-        "Runtime executions do not create evaluation records.",
-        "Integration test verifies evaluation creation for ANSWERER and no record for RUNTIME: uv run pytest -q tests/integration -k evaluation exits 0."
-      ],
-      "priority": 60,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-061",
-      "title": "Expose evaluation record via API",
-      "acceptanceCriteria": [
-        "src/rlm_rs/api/executions.py adds GET /v1/executions/{execution_id}/evaluation endpoint.",
-        "Response body includes evaluation record fields and uses a dedicated response model in src/rlm_rs/models.py.",
-        "Endpoint enforces tenant isolation and returns 404 when no evaluation exists.",
-        "Endpoint returns VALIDATION_ERROR when execution mode is RUNTIME, or returns 404 if not applicable, with behavior documented in tests.",
-        "Tests cover 200, 404, and cross-tenant access: uv run pytest -q tests/unit -k evaluation_api exits 0."
-      ],
-      "priority": 61,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-062",
-      "title": "Add LLM judge evaluation using Ragas",
-      "acceptanceCriteria": [
-        "Dependencies add ragas via uv add ragas and update uv.lock.",
-        "src/rlm_rs/settings.py adds EVAL_JUDGE_MODEL and EVAL_JUDGE_PROVIDER (or equivalent) with .env.example and compose.yaml updates.",
-        "Judge pipeline uses Ragas metrics answer_relevancy and faithfulness to score both answerer and baseline answers.",
-        "Judge inputs use question, answer, and contexts: answerer contexts derive from citation spans, baseline contexts use the concatenated full-document text.",
-        "Evaluation record stores judge metrics in a structured field with separate entries for answerer and baseline scores.",
-        "Judge run is gated behind ENABLE_EVAL_JUDGE=true and defaults to disabled.",
-        "Tests mock judge execution and verify persistence: uv run pytest -q tests/unit -k eval_judge exits 0."
-      ],
-      "priority": 62,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-063",
-      "title": "Show baseline answer alongside execution answer in UI",
-      "acceptanceCriteria": [
-        "ui/src/lib/types.ts adds an EvaluationRecord type that matches GET /v1/executions/{execution_id}/evaluation response fields, including baseline_status, baseline_skip_reason, baseline_answer, baseline_input_tokens, baseline_context_window, and judge_metrics.",
-        "ui/src/lib/api-client.ts adds getExecutionEvaluation(executionId) calling /v1/executions/{execution_id}/evaluation.",
-        "ui/src/app/executions/[execution_id]/page.tsx fetches evaluation when execution mode is ANSWERER and renders a Baseline section next to Answer on desktop and stacked on mobile.",
-        "Baseline section displays status badge, skip reason when status is SKIPPED, input tokens and context window values, and the baseline answer text when available.",
-        "If the evaluation endpoint returns 404, Baseline section shows EmptyState with Not available yet message; if mode is RUNTIME, Baseline section shows Not supported message.",
-        "Loading state uses SkeletonCard; non-404 errors show ErrorPanel.",
-        "npm run typecheck --prefix ui exits 0.",
-        "npm run lint --prefix ui exits 0."
-      ],
-      "priority": 63,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-064",
-      "title": "Show LLM judge results in UI",
-      "acceptanceCriteria": [
-        "ui/src/app/executions/[execution_id]/page.tsx adds an Evaluation section that renders judge_metrics when present.",
-        "Evaluation section shows a metric table with rows for answer_relevancy and faithfulness and columns for Answerer and Baseline values.",
-        "Metrics are formatted to two decimal places and show '-' when missing.",
-        "If judge_metrics is missing, Evaluation section shows EmptyState with Evaluation not run message.",
-        "Evaluation section remains hidden for runtime executions.",
-        "npm run typecheck --prefix ui exits 0.",
-        "npm run lint --prefix ui exits 0."
-      ],
-      "priority": 64,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-065",
-      "title": "Add evaluation running status and UI progress",
-      "acceptanceCriteria": [
-        "src/rlm_rs/models.py allows EvaluationBaselineStatus to be RUNNING.",
-        "src/rlm_rs/orchestrator/worker.py seeds an evaluation record with baseline_status RUNNING before baseline and judge work begins, using the same execution_id.",
-        "src/rlm_rs/storage/ddb.py adds update_evaluation and worker uses it to persist baseline_status, skip reason, baseline answer, token counts, context window, and judge_metrics at completion.",
-        "GET /v1/executions/{execution_id}/evaluation returns baseline_status RUNNING immediately after execution completion instead of 404 when evaluation is in progress.",
-        "ui/src/app/executions/[execution_id]/page.tsx polls for evaluation while baseline_status is RUNNING and renders a visible Evaluation running state for both Baseline and Evaluation panels.",
-        "UI no longer surfaces Evaluation not found errors while evaluation is running.",
-        "uv run pytest -q tests/unit -k evaluation exits 0.",
-        "npm run typecheck --prefix ui exits 0."
-      ],
-      "priority": 65,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-066",
-      "title": "Allow baseline eval when docs are indexed",
-      "acceptanceCriteria": [
-        "src/rlm_rs/orchestrator/baseline.py treats ingest_status INDEXING and INDEXED as parsed-ready when text_s3_uri is present.",
-        "Baseline skip reason MISSING_PARSED_TEXT is only used when a document lacks parsed text or text_s3_uri.",
-        "tests/unit/test_baseline.py adds coverage for INDEXED status and passes: uv run pytest -q tests/unit -k baseline exits 0."
-      ],
-      "priority": 66,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-067",
-      "title": "Make baseline token counting compatible with chat completions",
-      "acceptanceCriteria": [
-        "src/rlm_rs/orchestrator/baseline.py counts input tokens via chat.completions usage.prompt_tokens with max_tokens or max_completion_tokens as required.",
-        "If chat.completions token counting fails, baseline falls back to responses input_tokens.",
-        "Context window errors during token counting return CONTEXT_WINDOW_EXCEEDED instead of BASELINE_ERROR.",
-        "tests/unit/test_baseline.py fakes chat completions usage and passes: uv run pytest -q tests/unit -k baseline exits 0."
-      ],
-      "priority": 67,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-068",
-      "title": "Log and display root, sub, and tool code during execution",
-      "acceptanceCriteria": [
-        "src/rlm_rs/models.py defines CodeLogEntry and CodeLogResponse models with fields for execution_id, sequence, created_at, source (ROOT, SUB, TOOL), kind (REPL, TOOL_REQUEST, TOOL_RESULT), model_name, tool_type, and content.",
-        "Root and sub-model outputs extract the single ```repl``` fenced block content and append it as REPL entries without fences, preserving the code text as-is.",
-        "Tool requests and tool results are logged as TOOL_REQUEST and TOOL_RESULT entries with tool_type and payload content.",
-        "Code log entries are persisted in DynamoDB with ordering by execution_id and sequence, and scripts/localstack_init.sh creates the code log table using the DDB_TABLE_PREFIX.",
-        "Structured logs emit a code_log event with the same fields stored in DynamoDB.",
-        "When enable_trace_redaction is true, redaction applies to code log content and tool payloads before persistence to DynamoDB or logs.",
-        "GET /v1/executions/{execution_id}/code returns CodeLogResponse entries ordered by sequence with cursor-based pagination.",
-        "Execution detail UI adds a Code panel that displays repl code blocks and tool calls rendered as formatted JSON, with filters for root, sub, and tool entries.",
-        "Code panel updates during RUNNING or PENDING executions by polling the code log endpoint for new entries.",
-        "Unit tests cover repl extraction, tool call logging, redaction behavior, and code log ordering; integration test verifies code log entries are visible while execution is running.",
-        "Typecheck passes: uv run ruff check . exits 0.",
-        "Tests pass: uv run pytest -q exits 0."
-      ],
-      "priority": 68,
-      "passes": true,
-      "notes": ""
-    },
-    {
-      "id": "US-069",
-      "title": "Render execution code blocks with preserved formatting",
-      "acceptanceCriteria": [
-        "Execution detail Code panel renders repl entries using a dedicated CodeBlock component in the UI.",
-        "CodeBlock renders content in <pre><code> with a monospace font and preserves whitespace and indentation using white-space: pre.",
-        "CodeBlock renders code as plain text with no trimming or normalization of leading, trailing, or blank lines.",
-        "Long lines are not truncated with ellipses and remain accessible via scrolling or wrapping without altering whitespace.",
-        "UI test renders a repl sample with indentation, blank lines, and tabs and asserts rendered textContent equals the input string.",
-        "npm run typecheck --prefix ui exits 0.",
-        "npm run lint --prefix ui exits 0."
-      ],
-      "priority": 69,
       "passes": true,
       "notes": ""
     }

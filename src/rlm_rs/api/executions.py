@@ -34,6 +34,7 @@ from rlm_rs.models import (
     CodeLogEntry,
     CodeLogResponse,
     ContextDocument,
+    ContextItem,
     ContextManifest,
     CreateExecutionRequest,
     CreateExecutionResponse,
@@ -42,6 +43,7 @@ from rlm_rs.models import (
     ExecutionStepHistoryResponse,
     ExecutionStepSnapshot,
     ExecutionEvaluationResponse,
+    ExecutionContextsResponse,
     ExecutionStatus,
     ExecutionStatusResponse,
     ExecutionWaitRequest,
@@ -67,6 +69,7 @@ from rlm_rs.sandbox.runner import SandboxRunner
 from rlm_rs.sandbox.tool_api import build_tool_schema
 from rlm_rs.orchestrator.providers import FakeLLMProvider
 from rlm_rs.orchestrator.worker import OrchestratorWorker
+from rlm_rs.storage import contexts as contexts_store
 from rlm_rs.storage import ddb, s3, state as state_store
 from rlm_rs.storage.ddb import DdbTableNames
 
@@ -136,6 +139,14 @@ def _normalize_execution_options(
     payload["return_trace"] = return_trace
     payload["redact_trace"] = redact_trace
     return ExecutionOptions.model_validate(payload)
+
+
+def _resolve_output_mode(options: Mapping[str, Any] | None) -> str:
+    if isinstance(options, dict):
+        output_mode = options.get("output_mode")
+        if output_mode in ("ANSWER", "CONTEXTS"):
+            return output_mode
+    return "ANSWER"
 
 
 def _resolve_models(
@@ -216,6 +227,40 @@ def _load_state_payload(
     except state_store.StateValidationError as exc:
         raise_http_error(ErrorCode.STATE_INVALID_TYPE, str(exc))
     return state_json
+
+
+def _load_contexts_payload(
+    execution_item: Mapping[str, Any],
+    *,
+    s3_client: BaseClient | None,
+) -> list[ContextItem]:
+    contexts_s3_uri = execution_item.get("contexts_s3_uri")
+    if contexts_s3_uri:
+        if s3_client is None:
+            raise_http_error(ErrorCode.S3_READ_ERROR, "S3 client is not configured")
+        try:
+            payload = contexts_store.load_contexts_payload(
+                s3_client=s3_client,
+                contexts_s3_uri=str(contexts_s3_uri),
+            )
+            return [ContextItem.model_validate(item) for item in payload]
+        except contexts_store.ContextsValidationError as exc:
+            raise_http_error(ErrorCode.VALIDATION_ERROR, str(exc))
+        except ValueError as exc:
+            raise_http_error(ErrorCode.S3_READ_ERROR, str(exc))
+        except Exception as exc:  # noqa: BLE001
+            raise_http_error(ErrorCode.S3_READ_ERROR, f"Failed to read contexts: {exc}")
+
+    contexts_payload = state_store.normalize_json_value(execution_item.get("contexts"))
+    if contexts_payload is None:
+        return []
+    if not isinstance(contexts_payload, list):
+        raise_http_error(ErrorCode.VALIDATION_ERROR, "Contexts payload is invalid")
+    try:
+        contexts_store.validate_contexts_payload(contexts_payload)
+    except contexts_store.ContextsValidationError as exc:
+        raise_http_error(ErrorCode.VALIDATION_ERROR, str(exc))
+    return [ContextItem.model_validate(item) for item in contexts_payload]
 
 
 def _ensure_tool_state(state: dict[str, JsonValue]) -> None:
@@ -395,13 +440,24 @@ def _build_execution_response(item: Mapping[str, Any]) -> ExecutionStatusRespons
     return_trace = False
     if isinstance(options, dict):
         return_trace = options.get("return_trace") is True
+    output_mode = _resolve_output_mode(options)
+    answer = item.get("answer")
+    if output_mode == "CONTEXTS":
+        answer = None
+    contexts_s3_uri = item.get("contexts_s3_uri")
+    contexts_payload = None
+    if not contexts_s3_uri:
+        contexts_payload = state_store.normalize_json_value(item.get("contexts"))
     return ExecutionStatusResponse(
         execution_id=str(item["execution_id"]),
         mode=item.get("mode"),
+        output_mode=output_mode,
         status=str(item["status"]),
         question=item.get("question"),
-        answer=item.get("answer"),
+        answer=answer,
         citations=item.get("citations"),
+        contexts=contexts_payload,
+        contexts_s3_uri=contexts_s3_uri,
         budgets_requested=item.get("budgets_requested"),
         budgets_consumed=item.get("budgets_consumed"),
         started_at=item.get("started_at"),
@@ -430,11 +486,13 @@ def _build_evaluation_response(item: Mapping[str, Any]) -> ExecutionEvaluationRe
 
 
 def _build_execution_list_item(item: Mapping[str, Any]) -> ExecutionListItem:
+    options = item.get("options")
     return ExecutionListItem(
         execution_id=str(item["execution_id"]),
         session_id=str(item["session_id"]),
         tenant_id=str(item["tenant_id"]),
         mode=item.get("mode"),
+        output_mode=_resolve_output_mode(options),
         status=str(item["status"]),
         question=item.get("question"),
         answer=item.get("answer"),
@@ -593,6 +651,35 @@ def get_execution(
 
 
 @router.get(
+    "/executions/{execution_id}/contexts",
+    response_model=ExecutionContextsResponse,
+)
+def get_execution_contexts(
+    execution_id: str,
+    context: ApiKeyContext = Depends(require_api_key),
+    ddb_resource: ServiceResource = Depends(get_ddb_resource),
+    table_names: DdbTableNames = Depends(get_table_names),
+    s3_client: BaseClient = Depends(get_s3_client),
+    logger: BoundLogger = Depends(get_logger),
+) -> ExecutionContextsResponse:
+    executions_table = ddb_resource.Table(table_names.executions)
+    item = _get_execution_for_tenant(executions_table, execution_id, context.tenant_id)
+    ensure_tenant_access(item, context.tenant_id)
+
+    contexts_payload = _load_contexts_payload(item, s3_client=s3_client)
+
+    logger.info(
+        "executions.contexts",
+        tenant_id=context.tenant_id,
+        session_id=item.get("session_id"),
+        execution_id=execution_id,
+        returned=len(contexts_payload),
+    )
+
+    return ExecutionContextsResponse(contexts=contexts_payload)
+
+
+@router.get(
     "/executions/{execution_id}/evaluation",
     response_model=ExecutionEvaluationResponse,
 )
@@ -729,10 +816,17 @@ def get_execution_code(
     )
     entries: list[CodeLogEntry] = []
     for item in items:
+        turn_index = item.get("turn_index")
+        if turn_index is not None:
+            try:
+                turn_index = int(turn_index)
+            except (TypeError, ValueError):
+                turn_index = None
         entries.append(
             CodeLogEntry(
                 execution_id=str(item.get("execution_id") or execution_id),
                 sequence=int(item.get("sequence") or 0),
+                turn_index=turn_index,
                 created_at=str(item.get("created_at") or ""),
                 source=str(item["source"]),
                 kind=str(item["kind"]),

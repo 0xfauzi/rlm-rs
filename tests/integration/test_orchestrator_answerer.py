@@ -2,10 +2,16 @@ import os
 import threading
 from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 import pytest
 from botocore.exceptions import ClientError, EndpointConnectionError, NoCredentialsError
+from fastapi.testclient import TestClient
 
+from rlm_rs.api import auth
+from rlm_rs.api import dependencies as deps
+from rlm_rs.api.app import create_app
+from rlm_rs.api.auth import ApiKeyContext
 from rlm_rs.orchestrator.providers import FakeLLMProvider
 from rlm_rs.orchestrator.worker import OrchestratorWorker
 from rlm_rs.settings import Settings
@@ -54,6 +60,23 @@ def _ensure_tables(ddb_client: Any, prefix: str) -> ddb.DdbTableNames:
     for name in tables.__dict__.values():
         ddb.ensure_table(ddb_client, name)
     return tables
+
+
+def _build_api_client(
+    *,
+    tenant_id: str,
+    ddb_resource: Any,
+    tables: ddb.DdbTableNames,
+    s3_client: Any,
+) -> TestClient:
+    app = create_app()
+    app.dependency_overrides[deps.get_ddb_resource] = lambda: ddb_resource
+    app.dependency_overrides[deps.get_table_names] = lambda: tables
+    app.dependency_overrides[deps.get_s3_client] = lambda: s3_client
+    app.dependency_overrides[auth.require_api_key] = lambda: ApiKeyContext(
+        tenant_id=tenant_id
+    )
+    return TestClient(app)
 
 
 def _settings_with_env(
@@ -247,6 +270,192 @@ tool.FINAL(answer)
     citations = execution_item.get("citations")
     assert isinstance(citations, list)
     assert citations
+
+
+def test_orchestrator_answerer_contexts_mode() -> None:
+    previous_prefix = os.environ.get("DDB_TABLE_PREFIX")
+    prefix = f"rlm_test_{uuid4().hex[:8]}"
+    os.environ["DDB_TABLE_PREFIX"] = prefix
+
+    try:
+        s3_client, ddb_client, ddb_resource, bucket, _ = _ensure_localstack_clients()
+        _ensure_bucket(s3_client, bucket)
+        tables = _ensure_tables(ddb_client, prefix)
+
+        tenant_id = "tenant-orch-contexts"
+        session_id = "sess-orch-contexts"
+        doc_id = "doc-orch-contexts"
+        execution_id = "exec-orch-contexts"
+        ttl_epoch = int(datetime(2026, 1, 2, tzinfo=timezone.utc).timestamp())
+
+        text = "Alpha beta gamma delta"
+        text_key = (
+            "parsed/tenant-orch-contexts/sess-orch-contexts/doc-orch-contexts/text.txt"
+        )
+        offsets_key = (
+            "parsed/tenant-orch-contexts/sess-orch-contexts/doc-orch-contexts/offsets.json"
+        )
+        s3.put_bytes(s3_client, bucket, text_key, text.encode("utf-8"))
+        s3.put_json(s3_client, bucket, offsets_key, _build_offsets_payload(text))
+
+        sessions_table = ddb_resource.Table(tables.sessions)
+        documents_table = ddb_resource.Table(tables.documents)
+        executions_table = ddb_resource.Table(tables.executions)
+        execution_state_table = ddb_resource.Table(tables.execution_state)
+        evaluations_table = ddb_resource.Table(tables.evaluations)
+
+        ddb.create_session(
+            sessions_table,
+            tenant_id=tenant_id,
+            session_id=session_id,
+            status="READY",
+            created_at="2026-01-01T00:00:00Z",
+            expires_at="2026-01-02T00:00:00Z",
+            ttl_epoch=ttl_epoch,
+            doc_count=1,
+            options={"enable_search": False, "readiness_mode": "LAX"},
+        )
+        ddb.create_document(
+            documents_table,
+            tenant_id=tenant_id,
+            session_id=session_id,
+            doc_id=doc_id,
+            doc_index=0,
+            source_name="sample.txt",
+            mime_type="text/plain",
+            raw_s3_uri="s3://raw/sample.txt",
+            ingest_status="PARSED",
+            text_s3_uri=f"s3://{bucket}/{text_key}",
+            offsets_s3_uri=f"s3://{bucket}/{offsets_key}",
+            char_length=len(text),
+            byte_length=len(text.encode("utf-8")),
+        )
+
+        budgets = {
+            "max_turns": 3,
+            "max_total_seconds": 60,
+            "max_llm_subcalls": 2,
+            "max_llm_prompt_chars": 12000,
+            "max_total_llm_prompt_chars": 24000,
+        }
+        models = {"root_model": "fake-root", "sub_model": "fake-sub"}
+
+        ddb.create_execution(
+            executions_table,
+            tenant_id=tenant_id,
+            session_id=session_id,
+            execution_id=execution_id,
+            status="RUNNING",
+            mode="ANSWERER",
+            question="Return contexts",
+            budgets_requested=budgets,
+            models=models,
+            options={"output_mode": "CONTEXTS"},
+            started_at="2026-01-01T00:01:00Z",
+        )
+
+        state_record = state_store.persist_state_payload(
+            state={},
+            tenant_id=tenant_id,
+            execution_id=execution_id,
+            turn_index=0,
+        )
+        ddb.put_execution_state(
+            execution_state_table,
+            execution_id=execution_id,
+            turn_index=0,
+            updated_at="2026-01-01T00:01:00Z",
+            ttl_epoch=ttl_epoch,
+            state_json=state_record.state_json,
+            state_s3_uri=state_record.state_s3_uri,
+            checksum=state_record.checksum,
+            summary=state_record.summary,
+        )
+
+        region, endpoint_url, _, _ = _localstack_config()
+        settings = _settings_with_env(
+            bucket=bucket,
+            region=region,
+            endpoint_url=endpoint_url,
+            prefix=prefix,
+        )
+
+        root_outputs = [
+            """```repl
+doc = context[0]
+doc.slice(0, 5, tag="context")
+doc.slice(6, 10, tag="context:foo")
+doc.slice(11, 16, tag="note")
+tool.YIELD("collect more")
+```""",
+            """```repl
+doc = context[0]
+doc.slice(0, 5, tag="context")
+doc.slice(17, 22, tag="context")
+tool.FINAL("done")
+```""",
+        ]
+        provider = FakeLLMProvider(root_outputs=root_outputs)
+        worker = OrchestratorWorker(
+            settings=settings,
+            ddb_resource=ddb_resource,
+            table_names=tables,
+            s3_client=s3_client,
+            provider=provider,
+        )
+
+        processed = worker.run_once()
+        assert processed == 1
+
+        execution_item = ddb.get_execution(
+            executions_table,
+            session_id=session_id,
+            execution_id=execution_id,
+        )
+        assert execution_item is not None
+        assert execution_item["status"] == "COMPLETED"
+        assert execution_item.get("answer") is None
+
+        contexts = execution_item.get("contexts")
+        assert isinstance(contexts, list)
+        assert [item["text"] for item in contexts] == ["Alpha", "beta", "delta"]
+        assert [item["sequence_index"] for item in contexts] == [0, 1, 2]
+        assert [item["turn_index"] for item in contexts] == [0, 0, 1]
+        assert [item["span_index"] for item in contexts] == [0, 1, 1]
+        assert [item["tag"] for item in contexts] == ["context", "context:foo", "context"]
+        assert [item["text_char_length"] for item in contexts] == [5, 4, 5]
+        assert all(item["source_name"] == "sample.txt" for item in contexts)
+        assert all(item["mime_type"] == "text/plain" for item in contexts)
+
+        citations = execution_item.get("citations")
+        assert isinstance(citations, list)
+        assert len(citations) == len(contexts)
+
+        evaluation_item = ddb.get_evaluation(
+            evaluations_table,
+            execution_id=execution_id,
+        )
+        assert evaluation_item is None
+
+        client = _build_api_client(
+            tenant_id=tenant_id,
+            ddb_resource=ddb_resource,
+            tables=tables,
+            s3_client=s3_client,
+        )
+        for context_item, citation in zip(contexts, citations, strict=True):
+            assert context_item["ref"]["checksum"] == citation["checksum"]
+            payload = state_store.normalize_json_value(citation)
+            response = client.post("/v1/citations/verify", json={"ref": payload})
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["valid"] is True
+            assert payload["text"] == context_item["text"]
+    finally:
+        if previous_prefix is None:
+            os.environ.pop("DDB_TABLE_PREFIX", None)
+        else:
+            os.environ["DDB_TABLE_PREFIX"] = previous_prefix
 
 
 def test_code_logs_visible_while_execution_running() -> None:

@@ -44,6 +44,29 @@ def test_step_executor_limits_tool_requests() -> None:
     assert result.error.code == ErrorCode.BUDGET_EXCEEDED.value
 
 
+def test_step_executor_blocks_synthesis_without_required_notes() -> None:
+    code = (
+        "tool.queue_llm("
+        "'synth', "
+        "'Combine notes', "
+        "max_tokens=10, "
+        "metadata={'requires_llm_keys': ['note_1', 'note_2']}"
+        ")\n"
+    )
+    event = _make_event(
+        code=code,
+        state={"_tool_results": {"llm": {"note_1": {"text": "ok"}}, "search": {}}},
+    )
+
+    result = execute_step(event)
+
+    assert not result.success
+    assert result.error is not None
+    assert result.error.code == ErrorCode.VALIDATION_ERROR.value
+    assert result.error.details is not None
+    assert result.error.details["missing_llm_keys"] == ["note_2"]
+
+
 def test_step_executor_limits_spans(monkeypatch: pytest.MonkeyPatch) -> None:
     text = "hello world"
     text_bytes = text.encode("utf-8")

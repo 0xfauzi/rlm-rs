@@ -23,6 +23,10 @@ wheels/
 *.egg
 MANIFEST
 
+# Allow UI source lib directory to be tracked
+!ui/src/lib/
+!ui/src/lib/**
+
 # Virtual environments
 venv/
 env/

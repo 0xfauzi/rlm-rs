@@ -24,6 +24,7 @@ export type ExecutionStatus =
   | "BUDGET_EXCEEDED"
   | "MAX_TURNS_EXCEEDED";
 export type ExecutionMode = "ANSWERER" | "RUNTIME";
+export type ExecutionOutputMode = "ANSWER" | "CONTEXTS";
 
 export interface SessionOptions {
   enable_search?: boolean | null;
@@ -84,6 +85,7 @@ export interface ExecutionOptions {
   redact_trace?: boolean | null;
   synchronous?: boolean | null;
   synchronous_timeout_seconds?: number | null;
+  output_mode?: ExecutionOutputMode | null;
 }
 
 export interface SpanRef {
@@ -94,6 +96,18 @@ export interface SpanRef {
   start_char: number;
   end_char: number;
   checksum: string;
+}
+
+export interface ContextItem {
+  sequence_index: number;
+  turn_index: number;
+  span_index: number;
+  tag: string;
+  text: string;
+  text_char_length: number;
+  source_name: string;
+  mime_type: string;
+  ref: SpanRef;
 }
 
 export interface Citation {
@@ -167,6 +181,7 @@ export type CodeLogKind = "REPL" | "TOOL_REQUEST" | "TOOL_RESULT";
 export interface CodeLogEntry {
   execution_id: string;
   sequence: number;
+  turn_index?: number | null;
   created_at: string;
   source: CodeLogSource;
   kind: CodeLogKind;
@@ -185,6 +200,7 @@ export interface Execution {
   session_id: string;
   tenant_id: string;
   mode: ExecutionMode;
+  output_mode?: ExecutionOutputMode | null;
   status: ExecutionStatus;
   question?: string | null;
   answer?: string | null;
@@ -315,10 +331,13 @@ export interface CreateRuntimeExecutionResponse {
 export interface ExecutionStatusResponse {
   execution_id: string;
   mode?: ExecutionMode | null;
+  output_mode?: ExecutionOutputMode | null;
   status: ExecutionStatus;
   question?: string | null;
   answer?: string | null;
   citations?: SpanRef[] | null;
+  contexts?: ContextItem[] | null;
+  contexts_s3_uri?: string | null;
   budgets_requested?: Budgets | null;
   budgets_consumed?: BudgetsConsumed | null;
   started_at?: string | null;
@@ -326,11 +345,16 @@ export interface ExecutionStatusResponse {
   trace_s3_uri?: string | null;
 }
 
+export interface ExecutionContextsResponse {
+  contexts: ContextItem[];
+}
+
 export interface ExecutionListItem {
   execution_id: string;
   session_id: string;
   tenant_id: string;
   mode?: ExecutionMode | null;
+  output_mode?: ExecutionOutputMode | null;
   status: ExecutionStatus;
   question?: string | null;
   answer?: string | null;

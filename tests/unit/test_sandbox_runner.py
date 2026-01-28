@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 import json
 
-from rlm_rs.models import ContextManifest, StepEvent, StepResult
+from rlm_rs.models import ContextManifest, StepEvent
 from rlm_rs.sandbox.runner import SandboxRunner
 
 

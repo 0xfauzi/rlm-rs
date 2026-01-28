@@ -80,6 +80,15 @@ class Settings(BaseSettings):
     openai_max_retries: int | None = Field(
         default=None, validation_alias=AliasChoices("OPENAI_MAX_RETRIES")
     )
+    openai_use_responses_api: bool = Field(
+        default=False, validation_alias=AliasChoices("OPENAI_USE_RESPONSES_API")
+    )
+    subcall_reasoning_effort: str | None = Field(
+        default="low", validation_alias=AliasChoices("SUBCALL_REASONING_EFFORT")
+    )
+    subcall_min_completion_tokens: int | None = Field(
+        default=2048, validation_alias=AliasChoices("SUBCALL_MIN_COMPLETION_TOKENS")
+    )
     default_root_model: str | None = Field(
         default=None, validation_alias=AliasChoices("DEFAULT_ROOT_MODEL")
     )
@@ -153,6 +162,9 @@ class Settings(BaseSettings):
     @field_validator(
         "openai_timeout_seconds",
         "openai_max_retries",
+        "openai_use_responses_api",
+        "subcall_reasoning_effort",
+        "subcall_min_completion_tokens",
         "sandbox_lambda_timeout_seconds",
         mode="before",
     )

@@ -23,7 +23,13 @@ from rlm_rs.models import (
 )
 from rlm_rs.sandbox.ast_policy import ALLOWED_BUILTINS, AstPolicyError, validate_source
 from rlm_rs.sandbox.context import ContextView
-from rlm_rs.sandbox.tool_api import ToolAPI, ToolFinal, ToolRequestLimitError, ToolYield
+from rlm_rs.sandbox.tool_api import (
+    ToolAPI,
+    ToolFinal,
+    ToolPreconditionError,
+    ToolRequestLimitError,
+    ToolYield,
+)
 from rlm_rs.storage.state import (
     StateValidationError,
     canonical_state_bytes,
@@ -262,7 +268,7 @@ def execute_step(
         region=region,
         endpoint_url=endpoint_url,
     )
-    tool = ToolAPI(limits=event.limits)
+    tool = ToolAPI(limits=event.limits, state=event.state)
     max_step_seconds = event.limits.max_step_seconds if event.limits else None
     sandbox_globals: dict[str, object] = {
         "__builtins__": _allowed_builtins(),
@@ -288,6 +294,15 @@ def execute_step(
             final = StepFinal(is_final=False, answer=exc.reason)
         except ToolFinal as exc:
             final = StepFinal(is_final=True, answer=exc.answer)
+        except ToolPreconditionError as exc:
+            error = _build_error(
+                ErrorCode.VALIDATION_ERROR,
+                str(exc),
+                details={
+                    "requested_key": exc.key,
+                    "missing_llm_keys": exc.missing_llm_keys,
+                },
+            )
         except ToolRequestLimitError as exc:
             error = _build_error(
                 ErrorCode.BUDGET_EXCEEDED,

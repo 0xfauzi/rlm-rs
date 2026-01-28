@@ -14,6 +14,7 @@ Key files (by name):
 - `ddb.py`: DynamoDB table naming, key structure, and read/write helpers.
 - `s3.py`: S3 client helpers (including LocalStack-friendly configuration).
 - `state.py`: execution state persistence conventions (inline vs S3 blobs, checksums/summaries).
+- `contexts.py`: contexts payload persistence (inline vs S3 blobs) for contexts-mode executions.
 - `__init__.py`: package marker.
 
 ## How it connects to the rest of the repo
@@ -46,4 +47,3 @@ Key files (by name):
   - `uv run pytest -q tests/unit/test_state.py tests/unit/test_s3.py`
 - Integration roundtrip (LocalStack required):
   - `uv run pytest -q tests/integration/test_ddb_s3_roundtrip.py`
-

@@ -347,7 +347,13 @@ def build_trace_from_storage(
         ((execution_item.get("models") or {}).get("sub_model"))
         or ((session_item.get("models_default") or {}).get("sub_model"))
     )
-    prompt_version = root_prompt_version(subcalls_enabled=subcalls_enabled)
+    output_mode = "ANSWER"
+    options = execution_item.get("options")
+    if isinstance(options, dict) and options.get("output_mode") in ("ANSWER", "CONTEXTS"):
+        output_mode = str(options["output_mode"])
+    prompt_version = root_prompt_version(
+        subcalls_enabled=subcalls_enabled, output_mode=output_mode
+    )
     last_stdout: str | None = None
     last_error: str | None = None
     llm_subcalls = 0
@@ -374,6 +380,7 @@ def build_trace_from_storage(
             "last_error": last_error,
             "state_summary": None,
             "subcalls_enabled": subcalls_enabled,
+            "output_mode": output_mode,
         }
         root_prompt = build_root_prompt(
             question=str(execution_item.get("question") or ""),
@@ -384,6 +391,7 @@ def build_trace_from_storage(
             last_error=last_error,
             state_summary=None,
             subcalls_enabled=subcalls_enabled,
+            output_mode=output_mode,
         )
         state_payload = load_state_payload(step, s3_client=s3_client)
         tool_results = None

@@ -16,6 +16,17 @@ class ToolAPIError(Exception):
     pass
 
 
+class ToolPreconditionError(ToolAPIError):
+    def __init__(self, *, key: str, missing_llm_keys: list[str]) -> None:
+        message = (
+            "queue_llm blocked: missing required tool results for keys: "
+            + ", ".join(missing_llm_keys)
+        )
+        super().__init__(message)
+        self.key = key
+        self.missing_llm_keys = missing_llm_keys
+
+
 TOOL_SCHEMA_VERSION = "v1"
 
 _TOOL_SPECS: list[dict[str, JsonValue]] = [
@@ -204,8 +215,14 @@ class ToolFinal(BaseException):
 
 
 class ToolAPI:
-    def __init__(self, limits: LimitsSnapshot | None = None) -> None:
+    def __init__(
+        self,
+        limits: LimitsSnapshot | None = None,
+        *,
+        state: JsonValue | None = None,
+    ) -> None:
         self._limits = limits
+        self._state = state
         self._llm: list[LLMToolRequest] = []
         self._search: list[SearchToolRequest] = []
 
@@ -221,6 +238,9 @@ class ToolAPI:
         temperature: float | None = 0,
         metadata: dict[str, JsonValue] | None = None,
     ) -> None:
+        missing_keys = self._missing_required_llm_keys(metadata)
+        if missing_keys:
+            raise ToolPreconditionError(key=key, missing_llm_keys=missing_keys)
         provided_count = sum(
             value is not None
             for value in (max_tokens, max_output_tokens, max_output_chars)
@@ -279,3 +299,38 @@ class ToolAPI:
             return
         if len(self._llm) + len(self._search) >= limit:
             raise ToolRequestLimitError(limit)
+
+    def _missing_required_llm_keys(
+        self,
+        metadata: dict[str, JsonValue] | None,
+    ) -> list[str]:
+        if not metadata or not isinstance(metadata, dict):
+            return []
+        required = metadata.get("requires_llm_keys")
+        if not isinstance(required, list):
+            return []
+        required_keys = [key for key in required if isinstance(key, str) and key.strip()]
+        if not required_keys:
+            return []
+        llm_bucket = self._llm_results_bucket()
+        missing: list[str] = []
+        for req_key in required_keys:
+            entry = llm_bucket.get(req_key)
+            if not isinstance(entry, dict):
+                missing.append(req_key)
+                continue
+            text = entry.get("text")
+            if not isinstance(text, str) or not text.strip():
+                missing.append(req_key)
+        return missing
+
+    def _llm_results_bucket(self) -> dict[str, JsonValue]:
+        if not isinstance(self._state, dict):
+            return {}
+        tool_results = self._state.get("_tool_results")
+        if not isinstance(tool_results, dict):
+            return {}
+        llm_bucket = tool_results.get("llm")
+        if not isinstance(llm_bucket, dict):
+            return {}
+        return llm_bucket

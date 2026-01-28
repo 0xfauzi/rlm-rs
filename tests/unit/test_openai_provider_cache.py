@@ -128,6 +128,7 @@ def test_openai_provider_s3_cache_hits() -> None:
         max_tokens=10,
         temperature=0.0,
         prompt=prompt,
+        api_mode="chat",
     )
     assert ("cache-bucket", key) in fake_s3.objects
 

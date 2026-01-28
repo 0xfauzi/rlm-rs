@@ -15,6 +15,8 @@ class DocumentText:
     doc_id: str
     doc_index: int
     text: str
+    source_name: str | None = None
+    mime_type: str | None = None
 
 
 @dataclass(frozen=True)

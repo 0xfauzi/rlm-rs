@@ -56,13 +56,17 @@ def build_repl_entry(
     source: str,
     model_name: str | None,
     content: str,
+    turn_index: int | None = None,
 ) -> dict[str, JsonValue]:
-    return {
+    payload: dict[str, JsonValue] = {
         "source": source,
         "kind": "REPL",
         "model_name": model_name,
         "content": content,
     }
+    if turn_index is not None:
+        payload["turn_index"] = turn_index
+    return payload
 
 
 def build_repl_parse_error_entry(

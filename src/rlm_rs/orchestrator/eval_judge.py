@@ -513,6 +513,11 @@ def evaluate_judge(
 ) -> EvaluationJudgeMetrics | None:
     if not settings.enable_eval_judge:
         return None
+    if settings.openai_use_responses_api and logger is not None:
+        logger.warning(
+            "eval_judge_responses_api_unsupported",
+            note="Ragas/instructor uses chat.completions; Responses API flag does not apply",
+        )
     try:
         llm, embeddings = _build_ragas_components(settings)
     except ValueError as exc:

@@ -235,6 +235,9 @@ def build_llm_cache_key(
     max_tokens: int,
     temperature: float | None,
     prompt: str,
+    api_mode: str | None = None,
+    reasoning_effort: str | None = None,
+    verbosity: str | None = None,
     prefix: str = DEFAULT_LLM_CACHE_PREFIX,
 ) -> str:
     key_payload = {
@@ -242,6 +245,9 @@ def build_llm_cache_key(
         "model": model,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "api_mode": api_mode,
+        "reasoning_effort": reasoning_effort,
+        "verbosity": verbosity,
         "prompt_sha256": _prompt_sha256(prompt),
     }
     digest = hashlib.sha256(s3.deterministic_json_bytes(key_payload)).hexdigest()
@@ -304,6 +310,9 @@ class S3LLMCache:
         max_tokens: int,
         temperature: float | None,
         prompt: str,
+        api_mode: str | None = None,
+        reasoning_effort: str | None = None,
+        verbosity: str | None = None,
     ) -> str | None:
         key = build_llm_cache_key(
             tenant_id=tenant_id,
@@ -312,6 +321,9 @@ class S3LLMCache:
             max_tokens=max_tokens,
             temperature=temperature,
             prompt=prompt,
+            api_mode=api_mode,
+            reasoning_effort=reasoning_effort,
+            verbosity=verbosity,
             prefix=self._prefix,
         )
         try:
@@ -328,6 +340,8 @@ class S3LLMCache:
         text = response.get("text")
         if not isinstance(text, str):
             return None
+        if not text.strip():
+            return None
         return text
 
     def put_text(
@@ -341,7 +355,12 @@ class S3LLMCache:
         prompt: str,
         text: str,
         raw: dict[str, Any] | None = None,
+        api_mode: str | None = None,
+        reasoning_effort: str | None = None,
+        verbosity: str | None = None,
     ) -> str:
+        if not text:
+            return ""
         key = build_llm_cache_key(
             tenant_id=tenant_id,
             provider=provider,
@@ -349,6 +368,9 @@ class S3LLMCache:
             max_tokens=max_tokens,
             temperature=temperature,
             prompt=prompt,
+            api_mode=api_mode,
+            reasoning_effort=reasoning_effort,
+            verbosity=verbosity,
             prefix=self._prefix,
         )
         record = _cache_record(
@@ -376,6 +398,70 @@ def _should_retry_openai(exc: BaseException) -> bool:
     return False
 
 
+def _extract_text_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        nested = value.get("value")
+        if isinstance(nested, str):
+            return nested
+        nested = value.get("text")
+        if isinstance(nested, str):
+            return nested
+    nested = getattr(value, "value", None)
+    if isinstance(nested, str):
+        return nested
+    return ""
+
+
+def _is_text_part_type(part_type: Any) -> bool:
+    if not isinstance(part_type, str):
+        return True
+    normalized = part_type.strip().lower()
+    if normalized in {"text", "output_text"}:
+        return True
+    return False
+
+
+def _extract_chat_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+                continue
+            if isinstance(part, dict):
+                part_type = part.get("type")
+                if not _is_text_part_type(part_type):
+                    continue
+                parts.append(_extract_text_value(part.get("text")))
+                continue
+            part_type = getattr(part, "type", None)
+            if not _is_text_part_type(part_type):
+                continue
+            parts.append(_extract_text_value(getattr(part, "text", None)))
+        return "".join(segment for segment in parts if segment)
+    return ""
+
+
+def _extract_response_output(output: Any) -> str:
+    if not isinstance(output, (list, tuple)):
+        return ""
+    parts: list[str] = []
+    for item in output:
+        content = None
+        if isinstance(item, dict):
+            content = item.get("content")
+        else:
+            content = getattr(item, "content", None)
+        text = _extract_chat_content(content)
+        if text:
+            parts.append(text)
+    return "".join(parts)
+
+
 def _uses_max_completion_tokens(model: str | None) -> bool:
     if not model:
         return False
@@ -385,6 +471,26 @@ def _uses_max_completion_tokens(model: str | None) -> bool:
     if normalized.startswith("o") and len(normalized) > 1 and normalized[1].isdigit():
         return True
     return False
+
+
+def _supports_reasoning_effort(model: str | None) -> bool:
+    return _uses_max_completion_tokens(model)
+
+
+def _usage_reasoning_tokens(usage: Any) -> int | None:
+    if usage is None:
+        return None
+    details = getattr(usage, "completion_tokens_details", None)
+    if details is not None:
+        value = getattr(details, "reasoning_tokens", None)
+        if value is not None:
+            return int(value)
+    details = getattr(usage, "output_tokens_details", None)
+    if details is not None:
+        value = getattr(details, "reasoning_tokens", None)
+        if value is not None:
+            return int(value)
+    return None
 
 
 def _openai_error_payload(exc: BaseException) -> dict[str, Any] | None:
@@ -437,17 +543,52 @@ def _wants_default_temperature(exc: BaseException) -> bool:
             param = error.get("param")
             code = error.get("code")
             message = error.get("message")
-            if param == "temperature" and code in {
-                "unsupported_value",
-                "invalid_value",
-                "unsupported_parameter",
-            }:
-                return True
+            if param == "temperature":
+                if code in {
+                    "unsupported_value",
+                    "invalid_value",
+                    "unsupported_parameter",
+                }:
+                    return True
+                if code is None and isinstance(message, str):
+                    lowered = message.lower()
+                    if "unsupported" in lowered or "not supported" in lowered:
+                        return True
             if isinstance(message, str) and "temperature" in message.lower():
                 if "only the default" in message.lower():
                     return True
     text = str(exc).lower()
-    return "temperature" in text and "only the default" in text
+    if "temperature" in text and "only the default" in text:
+        return True
+    if "temperature" in text and ("unsupported" in text or "not supported" in text):
+        return True
+    return False
+
+
+def _wants_unsupported_param(exc: BaseException, params: set[str]) -> bool:
+    payload = _openai_error_payload(exc)
+    if payload:
+        error = payload.get("error")
+        if isinstance(error, dict):
+            param = error.get("param")
+            code = error.get("code")
+            message = error.get("message")
+            if isinstance(param, str) and param in params:
+                if code in {
+                    "unsupported_parameter",
+                    "unsupported_value",
+                    "invalid_value",
+                    "invalid_request_error",
+                }:
+                    return True
+            if isinstance(message, str):
+                lowered = message.lower()
+                if "unsupported" in lowered and any(p in lowered for p in params):
+                    return True
+    text = str(exc).lower()
+    if "unsupported" in text and any(p in text for p in params):
+        return True
+    return False
 
 
 class OpenAIProvider:
@@ -465,6 +606,9 @@ class OpenAIProvider:
         s3_bucket: str | None = None,
         cache_prefix: str = DEFAULT_LLM_CACHE_PREFIX,
         logger: BoundLogger | None = None,
+        use_responses_api: bool = False,
+        subcall_reasoning_effort: str | None = None,
+        subcall_min_completion_tokens: int | None = None,
     ) -> None:
         if timeout_seconds is None:
             timeout_seconds = DEFAULT_OPENAI_TIMEOUT_SECONDS
@@ -484,6 +628,24 @@ class OpenAIProvider:
         self._max_retries = max_retries
         self._provider_name = normalized_provider
         self._logger = logger or get_logger("rlm_rs.llm")
+        self._use_responses_api = bool(use_responses_api)
+        normalized_effort = (
+            subcall_reasoning_effort.strip().lower()
+            if isinstance(subcall_reasoning_effort, str)
+            and subcall_reasoning_effort.strip()
+            else None
+        )
+        self._subcall_reasoning_effort = normalized_effort
+        if subcall_min_completion_tokens is None:
+            self._subcall_min_completion_tokens = None
+        else:
+            try:
+                parsed_min_tokens = int(subcall_min_completion_tokens)
+            except (TypeError, ValueError):
+                parsed_min_tokens = None
+            self._subcall_min_completion_tokens = (
+                parsed_min_tokens if parsed_min_tokens and parsed_min_tokens > 0 else None
+            )
         self._cache = None
         if s3_client is not None and s3_bucket is not None:
             self._cache = S3LLMCache(s3_client, s3_bucket, prefix=cache_prefix)
@@ -495,12 +657,20 @@ class OpenAIProvider:
         *,
         tenant_id: str | None = None,
     ) -> str:
-        text, raw = self._chat_completion_with_meta(
-            prompt,
-            model,
-            max_tokens=None,
-            temperature=None,
-        )
+        if self._use_responses_api:
+            text, raw = self._responses_completion_with_meta(
+                prompt,
+                model,
+                max_tokens=None,
+                temperature=None,
+            )
+        else:
+            text, raw = self._chat_completion_with_meta(
+                prompt,
+                model,
+                max_tokens=None,
+                temperature=None,
+            )
         self._log_completion(
             call_kind="root",
             model=model,
@@ -517,12 +687,20 @@ class OpenAIProvider:
         *,
         tenant_id: str | None = None,
     ) -> str:
-        text, raw = self._chat_completion_with_meta(
-            prompt,
-            model,
-            max_tokens=None,
-            temperature=None,
-        )
+        if self._use_responses_api:
+            text, raw = self._responses_completion_with_meta(
+                prompt,
+                model,
+                max_tokens=None,
+                temperature=None,
+            )
+        else:
+            text, raw = self._chat_completion_with_meta(
+                prompt,
+                model,
+                max_tokens=None,
+                temperature=None,
+            )
         self._log_completion(
             call_kind="baseline",
             model=model,
@@ -542,33 +720,86 @@ class OpenAIProvider:
         tenant_id: str | None = None,
     ) -> str:
         effective_temperature = 0.0 if temperature is None else temperature
+        requested_max_tokens = max_tokens
+        effective_max_tokens = max_tokens
+        if self._subcall_min_completion_tokens is not None:
+            effective_max_tokens = max(
+                effective_max_tokens,
+                self._subcall_min_completion_tokens,
+            )
+        api_mode = "responses" if self._use_responses_api else "chat"
         if tenant_id and self._cache is not None:
             cached = self._cache.get_text(
                 tenant_id=tenant_id,
                 provider=self._provider_name,
                 model=model,
-                max_tokens=max_tokens,
+                max_tokens=effective_max_tokens,
                 temperature=effective_temperature,
                 prompt=prompt,
+                api_mode=api_mode,
+                reasoning_effort=self._subcall_reasoning_effort,
             )
             if cached is not None:
                 return cached
-        text, raw = self._chat_completion_with_meta(
-            prompt,
-            model,
-            max_tokens=max_tokens,
-            temperature=effective_temperature,
-        )
+        if self._use_responses_api:
+            text, raw = self._responses_completion_with_meta(
+                prompt,
+                model,
+                max_tokens=effective_max_tokens,
+                temperature=effective_temperature,
+                reasoning_effort=self._subcall_reasoning_effort,
+            )
+        else:
+            text, raw = self._chat_completion_with_meta(
+                prompt,
+                model,
+                max_tokens=effective_max_tokens,
+                temperature=effective_temperature,
+                reasoning_effort=self._subcall_reasoning_effort,
+            )
+        if self._logger is not None and not text.strip():
+            payload: dict[str, Any] = {
+                "call_kind": "subcall",
+                "model": model,
+                "max_tokens": effective_max_tokens,
+                "requested_max_tokens": requested_max_tokens,
+                "temperature": effective_temperature,
+                "prompt_chars": len(prompt),
+                "prompt_sha256": _prompt_sha256(prompt),
+                "output_chars": len(text),
+                "api_mode": api_mode,
+                "reasoning_effort": self._subcall_reasoning_effort,
+            }
+            response_id = raw.get("id")
+            if isinstance(response_id, str) and response_id:
+                payload["response_id"] = response_id
+            finish_reason = raw.get("finish_reason")
+            if isinstance(finish_reason, str) and finish_reason:
+                payload["finish_reason"] = finish_reason
+            usage = raw.get("usage")
+            if isinstance(usage, dict):
+                for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                    value = usage.get(field)
+                    if value is not None:
+                        payload[field] = value
+                reasoning_tokens = usage.get("reasoning_tokens")
+                if reasoning_tokens is not None:
+                    payload["reasoning_tokens"] = reasoning_tokens
+            if tenant_id:
+                payload["tenant_id"] = tenant_id
+            self._logger.warning("llm_empty_response", **payload)
         if tenant_id and self._cache is not None:
             self._cache.put_text(
                 tenant_id=tenant_id,
                 provider=self._provider_name,
                 model=model,
-                max_tokens=max_tokens,
+                max_tokens=effective_max_tokens,
                 temperature=effective_temperature,
                 prompt=prompt,
                 text=text,
                 raw=raw,
+                api_mode=api_mode,
+                reasoning_effort=self._subcall_reasoning_effort,
             )
         return text
 
@@ -623,6 +854,7 @@ class OpenAIProvider:
         *,
         max_tokens: int | None,
         temperature: float | None,
+        reasoning_effort: str | None = None,
     ) -> tuple[str, dict[str, Any]]:
         if not model:
             raise ValueError("model is required for OpenAI provider")
@@ -638,6 +870,8 @@ class OpenAIProvider:
                 payload["max_tokens"] = max_tokens
         if temperature is not None:
             payload["temperature"] = temperature
+        if reasoning_effort and _supports_reasoning_effort(model):
+            payload["reasoning_effort"] = reasoning_effort
 
         def _call(request_payload: dict[str, Any]) -> Any:
             return self._client.chat.completions.create(**request_payload)
@@ -651,9 +885,12 @@ class OpenAIProvider:
                 if "max_tokens" in retry_payload:
                     retry_payload.pop("max_tokens", None)
                     retry_payload["max_completion_tokens"] = max_tokens
-                    retry = True
+                retry = True
             if _wants_default_temperature(exc) and "temperature" in retry_payload:
                 retry_payload.pop("temperature", None)
+                retry = True
+            if _wants_unsupported_param(exc, {"reasoning_effort"}):
+                retry_payload.pop("reasoning_effort", None)
                 retry = True
             if not retry:
                 raise
@@ -666,8 +903,17 @@ class OpenAIProvider:
             finish_reason = getattr(choice, "finish_reason", None)
             message = getattr(choice, "message", None)
             content = getattr(message, "content", None)
-            if isinstance(content, str):
-                text = content
+            text = _extract_chat_content(content)
+            if not text:
+                refusal = getattr(message, "refusal", None)
+                if isinstance(refusal, str):
+                    text = refusal
+            if not text:
+                output_text = getattr(response, "output_text", None)
+                if isinstance(output_text, str):
+                    text = output_text
+            if not text:
+                text = _extract_response_output(getattr(response, "output", None))
         raw: dict[str, Any] = {}
         response_id = getattr(response, "id", None)
         if response_id:
@@ -681,6 +927,96 @@ class OpenAIProvider:
                 value = getattr(usage, field, None)
                 if value is not None:
                     usage_payload[field] = value
+            reasoning_tokens = _usage_reasoning_tokens(usage)
+            if reasoning_tokens is not None:
+                usage_payload["reasoning_tokens"] = reasoning_tokens
+            if usage_payload:
+                raw["usage"] = usage_payload
+        return text, raw
+
+    def _responses_completion_with_meta(
+        self,
+        prompt: str,
+        model: str | None,
+        *,
+        max_tokens: int | None,
+        temperature: float | None,
+        reasoning_effort: str | None = None,
+        text_verbosity: str | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        if not model:
+            raise ValueError("model is required for OpenAI provider")
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": prompt,
+        }
+        if max_tokens is not None:
+            payload["max_output_tokens"] = max_tokens
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if reasoning_effort and _supports_reasoning_effort(model):
+            payload["reasoning"] = {"effort": reasoning_effort}
+        if text_verbosity:
+            payload["text"] = {"verbosity": text_verbosity}
+
+        def _call(request_payload: dict[str, Any]) -> Any:
+            return self._client.responses.create(**request_payload)
+
+        try:
+            response = self._with_retries(lambda: _call(payload))
+        except APIStatusError as exc:
+            retry_payload = dict(payload)
+            retry = False
+            if _wants_default_temperature(exc) and "temperature" in retry_payload:
+                retry_payload.pop("temperature", None)
+                retry = True
+            if _wants_unsupported_param(exc, {"reasoning", "reasoning.effort"}):
+                retry_payload.pop("reasoning", None)
+                retry = True
+            if _wants_unsupported_param(exc, {"text", "text.verbosity"}):
+                retry_payload.pop("text", None)
+                retry = True
+            if not retry:
+                raise
+            response = self._with_retries(lambda: _call(retry_payload))
+
+        text = ""
+        output_text = getattr(response, "output_text", None)
+        if isinstance(output_text, str):
+            text = output_text
+        if not text:
+            text = _extract_response_output(getattr(response, "output", None))
+
+        raw: dict[str, Any] = {}
+        response_id = getattr(response, "id", None)
+        if response_id:
+            raw["id"] = response_id
+        incomplete = getattr(response, "incomplete_details", None)
+        finish_reason = None
+        if incomplete is not None:
+            reason = getattr(incomplete, "reason", None)
+            if isinstance(reason, str) and reason:
+                finish_reason = reason
+        if not finish_reason:
+            finish_reason = "stop"
+        if finish_reason:
+            raw["finish_reason"] = finish_reason
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            usage_payload: dict[str, Any] = {}
+            input_tokens = getattr(usage, "input_tokens", None)
+            output_tokens = getattr(usage, "output_tokens", None)
+            total_tokens = getattr(usage, "total_tokens", None)
+            if input_tokens is not None:
+                usage_payload["prompt_tokens"] = input_tokens
+            if output_tokens is not None:
+                usage_payload["completion_tokens"] = output_tokens
+            if total_tokens is not None:
+                usage_payload["total_tokens"] = total_tokens
+            reasoning_tokens = _usage_reasoning_tokens(usage)
+            if reasoning_tokens is not None:
+                usage_payload["reasoning_tokens"] = reasoning_tokens
             if usage_payload:
                 raw["usage"] = usage_payload
         return text, raw

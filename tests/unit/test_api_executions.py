@@ -216,6 +216,7 @@ def _seed_execution(
     execution_id: str,
     status: str = "RUNNING",
     mode: str = "ANSWERER",
+    options: dict[str, Any] | None = None,
 ) -> None:
     tables = _table_names()
     executions_table = resource.Table(tables.executions)
@@ -228,6 +229,7 @@ def _seed_execution(
         mode=mode,
         question="hello?",
         started_at="2026-01-01T00:00:00Z",
+        options=options,
     )
 
 
@@ -287,7 +289,11 @@ def test_create_execution_persists_execution_and_state() -> None:
     assert execution_item["mode"] == "ANSWERER"
     assert execution_item["status"] == "RUNNING"
     assert execution_item["question"] == "What is the summary?"
-    assert execution_item["options"] == {"return_trace": False, "redact_trace": False}
+    assert execution_item["options"] == {
+        "return_trace": False,
+        "redact_trace": False,
+        "output_mode": "ANSWER",
+    }
 
     state_item = next(iter(execution_state_table.items.values()))
     assert state_item["execution_id"] == execution_item["execution_id"]
@@ -319,7 +325,11 @@ def test_create_execution_allows_trace_options_when_enabled(monkeypatch) -> None
 
     assert response.status_code == 200
     execution_item = next(iter(resource.tables["executions"].items.values()))
-    assert execution_item["options"] == {"return_trace": True, "redact_trace": True}
+    assert execution_item["options"] == {
+        "return_trace": True,
+        "redact_trace": True,
+        "output_mode": "ANSWER",
+    }
 
 
 def test_create_execution_clamps_trace_options_when_disabled(monkeypatch) -> None:
@@ -342,7 +352,60 @@ def test_create_execution_clamps_trace_options_when_disabled(monkeypatch) -> Non
 
     assert response.status_code == 200
     execution_item = next(iter(resource.tables["executions"].items.values()))
-    assert execution_item["options"] == {"return_trace": False, "redact_trace": False}
+    assert execution_item["options"] == {
+        "return_trace": False,
+        "redact_trace": False,
+        "output_mode": "ANSWER",
+    }
+
+
+def test_execution_output_mode_persists_and_returns_contexts() -> None:
+    resource = _FakeDdbResource()
+    tenant_id = "tenant-output"
+    session_id = "sess-output"
+    _seed_ready_session(resource, tenant_id, session_id)
+
+    client = _build_client(tenant_id, resource)
+    response = client.post(
+        f"/v1/sessions/{session_id}/executions",
+        json={"question": "Show contexts", "options": {"output_mode": "CONTEXTS"}},
+    )
+
+    assert response.status_code == 200
+    execution_id = response.json()["execution_id"]
+    execution_item = next(iter(resource.tables["executions"].items.values()))
+    assert execution_item["options"] == {
+        "return_trace": False,
+        "redact_trace": False,
+        "output_mode": "CONTEXTS",
+    }
+
+    get_response = client.get(f"/v1/executions/{execution_id}")
+    assert get_response.status_code == 200
+    assert get_response.json()["output_mode"] == "CONTEXTS"
+
+
+def test_execution_output_mode_defaults_to_answer_for_existing_records() -> None:
+    resource = _FakeDdbResource()
+    tenant_id = "tenant-default"
+    session_id = "sess-default"
+    execution_id = "exec-default"
+    _seed_execution(
+        resource,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        execution_id=execution_id,
+        options={"return_trace": False, "redact_trace": False},
+    )
+
+    client = _build_client(tenant_id, resource)
+    get_response = client.get(f"/v1/executions/{execution_id}")
+    assert get_response.status_code == 200
+    assert get_response.json()["output_mode"] == "ANSWER"
+
+    list_response = client.get("/v1/executions")
+    assert list_response.status_code == 200
+    assert list_response.json()["executions"][0]["output_mode"] == "ANSWER"
 
 
 def test_get_execution_hides_trace_when_return_trace_disabled() -> None:

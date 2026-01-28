@@ -21,6 +21,7 @@ ExecutionStatus: TypeAlias = Literal[
     "MAX_TURNS_EXCEEDED",
 ]
 ExecutionMode: TypeAlias = Literal["ANSWERER", "RUNTIME"]
+ExecutionOutputMode: TypeAlias = Literal["ANSWER", "CONTEXTS"]
 ToolRequestStatus: TypeAlias = Literal["pending", "resolved", "error"]
 EvaluationBaselineStatus: TypeAlias = Literal["COMPLETED", "SKIPPED", "RUNNING"]
 CodeLogSource: TypeAlias = Literal["ROOT", "SUB", "TOOL"]
@@ -79,6 +80,7 @@ class ExecutionOptions(RLMBaseModel):
     redact_trace: bool | None = None
     synchronous: bool | None = None
     synchronous_timeout_seconds: int | None = None
+    output_mode: ExecutionOutputMode = "ANSWER"
 
 
 class RuntimeStepOptions(RLMBaseModel):
@@ -192,13 +194,28 @@ class SpanRef(RLMBaseModel):
     checksum: str
 
 
+class ContextItem(RLMBaseModel):
+    sequence_index: int
+    turn_index: int
+    span_index: int
+    tag: str
+    text: str
+    text_char_length: int
+    source_name: str
+    mime_type: str
+    ref: SpanRef
+
+
 class ExecutionStatusResponse(RLMBaseModel):
     execution_id: str
     mode: ExecutionMode | None = None
+    output_mode: ExecutionOutputMode = "ANSWER"
     status: ExecutionStatus
     question: str | None = None
     answer: str | None = None
     citations: list[SpanRef] | None = None
+    contexts: list[ContextItem] | None = None
+    contexts_s3_uri: str | None = None
     budgets_requested: Budgets | None = None
     budgets_consumed: BudgetsConsumed | None = None
     started_at: str | None = None
@@ -206,11 +223,16 @@ class ExecutionStatusResponse(RLMBaseModel):
     trace_s3_uri: str | None = None
 
 
+class ExecutionContextsResponse(RLMBaseModel):
+    contexts: list[ContextItem]
+
+
 class ExecutionListItem(RLMBaseModel):
     execution_id: str
     session_id: str
     tenant_id: str
     mode: ExecutionMode | None = None
+    output_mode: ExecutionOutputMode = "ANSWER"
     status: ExecutionStatus
     question: str | None = None
     answer: str | None = None
@@ -385,6 +407,7 @@ class ExecutionStepHistoryResponse(RLMBaseModel):
 class CodeLogEntry(RLMBaseModel):
     execution_id: str
     sequence: int
+    turn_index: int | None = None
     created_at: str
     source: CodeLogSource
     kind: CodeLogKind

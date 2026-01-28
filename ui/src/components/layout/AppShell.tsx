@@ -29,8 +29,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           />
         ) : null}
         <Sidebar isOpen={sidebarOpen} onClose={handleCloseSidebar} />
-        <main className="flex-1 px-4 py-8 md:px-8">
-          <div className="mx-auto w-full max-w-6xl rounded-3xl border border-white/60 bg-white/70 p-6 shadow-sm backdrop-blur">
+        <main className="flex-1 px-3 py-8 md:px-4 xl:px-6">
+          <div className="mx-auto w-full max-w-none rounded-3xl border border-white/60 bg-white/70 p-6 shadow-sm backdrop-blur">
             <ErrorBoundary>{children}</ErrorBoundary>
           </div>
         </main>
